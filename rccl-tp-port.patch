@@ -1,0 +1,738 @@
+diff --git a/ggml/include/ggml-cuda.h b/ggml/include/ggml-cuda.h
+index 1cd81ee..109cb1f 100644
+--- a/ggml/include/ggml-cuda.h
++++ b/ggml/include/ggml-cuda.h
+@@ -22,6 +22,13 @@ extern "C" {
+ // backend API
+ GGML_BACKEND_API ggml_backend_t ggml_backend_cuda_init(int device);
+ 
++// Explicitly join the cross-process NCCL/RCCL "world" communicator used by
++// GGML_OP_ALLREDUCE. Reads GGML_NCCL_RANK / GGML_NCCL_WORLD / GGML_NCCL_MASTER.
++// Blocking (rendezvous with the other ranks). Also happens lazily on first
++// GGML_OP_ALLREDUCE execution; call this early for deterministic startup.
++// Returns false if the env is not configured, NCCL is not compiled in, or init failed.
++GGML_BACKEND_API bool ggml_backend_cuda_world_init(void);
++
+ GGML_BACKEND_API bool ggml_backend_is_cuda(ggml_backend_t backend);
+ 
+ // device buffer
+diff --git a/ggml/include/ggml-rpc.h b/ggml/include/ggml-rpc.h
+index 16ca339..2f59382 100644
+--- a/ggml/include/ggml-rpc.h
++++ b/ggml/include/ggml-rpc.h
+@@ -8,10 +8,10 @@ extern "C" {
+ 
+ #define RPC_PROTO_MAJOR_VERSION    4
+ #define RPC_PROTO_MINOR_VERSION    0
+-#define RPC_PROTO_PATCH_VERSION    3
++#define RPC_PROTO_PATCH_VERSION    4  // +1: GGML_OP_ALLREDUCE added (op enum extended)
+ 
+ #ifdef  __cplusplus
+-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
++static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
+ #endif
+ 
+ #define GGML_RPC_MAX_SERVERS       16
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 35f0c44..6e1e9e8 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -590,6 +590,8 @@ extern "C" {
+ 
+         GGML_OP_GLU,
+ 
++        GGML_OP_ALLREDUCE,
++
+         GGML_OP_COUNT,
+     };
+ 
+@@ -1544,6 +1546,13 @@ extern "C" {
+             struct ggml_tensor  * a,
+             enum   ggml_type      type);
+ 
++    // cross-process sum-allreduce over the NCCL/RCCL "world" communicator
++    // (see GGML_NCCL_RANK/GGML_NCCL_WORLD/GGML_NCCL_MASTER). result = sum over ranks of a.
++    // Only supported by backends with a world communicator (CUDA/HIP + NCCL builds).
++    GGML_API struct ggml_tensor * ggml_allreduce(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * a);
++
+     // make contiguous
+     GGML_API struct ggml_tensor * ggml_cont(
+             struct ggml_context * ctx,
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index a5a3a58..943b5ee 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -2190,6 +2190,47 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+         return GGML_STATUS_SUCCESS;
+     };
+ 
++    // Cross-NODE all-reduce via a NCCL/RCCL "world" communicator (GGML_META_WORLD_ALLREDUCE=1).
++    // Each backend executes an IN-PLACE GGML_OP_ALLREDUCE on its shard as its own world rank:
++    // backend 0 (local CUDA) is rank 0, backend 1 (an ggml-rpc peer) is rank 1. Both graphs are
++    // dispatched with the non-blocking async path (CUDA stream / fire-and-forget RPC) so the ranks
++    // rendezvous *inside* the collective — no per-op host round-trips (the whole point of the port).
++    // Requires GGML_NCCL_RANK/WORLD/MASTER set on BOTH processes (head + ggml-rpc-server).
++    const bool world_allreduce = getenv("GGML_META_WORLD_ALLREDUCE") != nullptr;
++    auto allreduce_world = [&](size_t i) -> ggml_status {
++        std::vector<ggml_cgraph *> step_cgraphs(n_backends, nullptr);
++        for (size_t j = 0; j < n_backends; j++) {
++            auto & bcj = backend_ctx->backend_configs[j];
++            ggml_tensor * node = bcj.cgraphs[i].cgraph_main->nodes[bcj.cgraphs[i].cgraph_main->n_nodes - 1];
++            ggml_tensor * node_ar = get_node_aux(node);
++            node_ar->view_src  = node->view_src == nullptr ? node : node->view_src;
++            node_ar->view_offs = node->view_offs;
++            node_ar->op        = GGML_OP_ALLREDUCE;   // in-place: node_ar aliases node's data
++            node_ar->src[0]    = node;
++            node_ar->flags    |= GGML_TENSOR_FLAG_COMPUTE;
++            ggml_backend_view_init(node_ar);
++            step_cgraphs[j] = get_cgraph_aux();
++            step_cgraphs[j]->nodes[0] = node_ar;
++            step_cgraphs[j]->n_nodes  = 1;
++        }
++        // Dispatch order matters: backend 0 is the LOCAL CUDA backend, whose graph_compute_async
++        // runs the allreduce INLINE and blocks in world_init (rank 0 accept) waiting for the peer.
++        // The remote (RPC) backends dispatch fire-and-forget (non-blocking). So we must dispatch
++        // the remote backends FIRST — they ship the peer its allreduce and the peer's world_init
++        // retry-connects — THEN dispatch the local backend, which now finds the peer at rendezvous.
++        // Iterate high->low (n-1 .. 0) so RPC ranks go before the blocking local rank 0.
++        for (size_t jj = n_backends; jj-- > 0; ) {
++            const ggml_status status = ggml_backend_graph_compute_async(backend_ctx->backend_configs[jj].backend, step_cgraphs[jj]);
++            if (status != GGML_STATUS_SUCCESS) {
++                return status;
++            }
++        }
++        for (size_t j = 0; j < n_backends; j++) {
++            ggml_backend_synchronize(backend_ctx->backend_configs[j].backend);
++        }
++        return GGML_STATUS_SUCCESS;
++    };
++
+ 
+     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
+         for (size_t j = 0; j < n_backends; j++) {
+@@ -2201,6 +2242,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+         }
+ 
+         if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
++            if (world_allreduce) {
++                const ggml_status status = allreduce_world(i);
++                if (status != GGML_STATUS_SUCCESS) {
++                    return status;
++                }
++                continue;
++            }
+             bool backend_allreduce_success = false;
+             if (backend_ctx->comm_ctx) {
+                 std::vector<ggml_tensor *> nodes;
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 4aaa4f3..4e96294 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1169,6 +1169,152 @@ static void ggml_backend_cuda_comm_init_internal(ggml_backend_cuda_comm_context
+     ggml_backend_cuda_comm_init_none(ret);
+ }
+ 
++// ---------------------------------------------------------------------------
++// Cross-process "world" communicator: tensor parallelism across NODES.
++//
++// Unlike the per-meta-backend comm context above (ncclCommInitAll over local
++// GPUs in one process), this is a process-global communicator built with
++// ncclCommInitRank so the ranks can live in different processes on different
++// machines (e.g. llama-server as rank 0 and ggml-rpc-server as rank 1).
++// The ncclUniqueId is exchanged over a plain TCP socket; NCCL/RCCL then runs
++// the collective over its own transports (sockets or IB verbs).
++//
++// Config (env, all three required):
++//   GGML_NCCL_RANK    rank of this process (0 = master / rendezvous listener)
++//   GGML_NCCL_WORLD   world size (2 for a two-node split)
++//   GGML_NCCL_MASTER  <ip:port> where rank 0 listens for the id exchange
++//
++// Consumed by GGML_OP_ALLREDUCE graph nodes: each rank executes its own copy
++// of the graph and the ranks rendezvous *inside* the collective — no per-op
++// RPC round trips. Single-GPU-per-process is assumed (device 0).
++#ifdef GGML_USE_NCCL
++#include <arpa/inet.h>
++#include <netinet/in.h>
++#include <netinet/tcp.h>
++#include <sys/socket.h>
++#include <unistd.h>
++
++static ncclComm_t g_world_comm = nullptr;
++static int        g_world_rank = -1;
++static int        g_world_size = 0;
++static std::mutex g_world_mutex;
++
++static bool ggml_cuda_world_configured(void) {
++    return getenv("GGML_NCCL_RANK") != nullptr &&
++           getenv("GGML_NCCL_WORLD") != nullptr &&
++           getenv("GGML_NCCL_MASTER") != nullptr;
++}
++
++static bool ggml_cuda_world_init_once(void) {
++    std::lock_guard<std::mutex> lock(g_world_mutex);
++    if (g_world_comm != nullptr) {
++        return true;
++    }
++    if (!ggml_cuda_world_configured()) {
++        return false;
++    }
++
++    const int rank  = atoi(getenv("GGML_NCCL_RANK"));
++    const int world = atoi(getenv("GGML_NCCL_WORLD"));
++
++    char master[256];
++    snprintf(master, sizeof(master), "%s", getenv("GGML_NCCL_MASTER"));
++    char * colon = strrchr(master, ':');
++    if (colon == nullptr || world < 2 || rank < 0 || rank >= world) {
++        GGML_LOG_ERROR("%s: bad world config (rank=%d world=%d master=%s)\n", __func__, rank, world, master);
++        return false;
++    }
++    *colon = '\0';
++    const char * ip   = master;
++    const int    port = atoi(colon + 1);
++
++    ncclUniqueId id;
++    if (rank == 0) {
++        NCCL_CHECK(ncclGetUniqueId(&id));
++        int srv = socket(AF_INET, SOCK_STREAM, 0);
++        if (srv < 0) { GGML_LOG_ERROR("%s: socket() failed\n", __func__); return false; }
++        int yes = 1;
++        setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
++        sockaddr_in addr = {};
++        addr.sin_family      = AF_INET;
++        addr.sin_port        = htons((uint16_t) port);
++        addr.sin_addr.s_addr = INADDR_ANY;
++        if (bind(srv, (sockaddr *) &addr, sizeof(addr)) != 0 || listen(srv, world) != 0) {
++            GGML_LOG_ERROR("%s: bind/listen on port %d failed\n", __func__, port);
++            close(srv);
++            return false;
++        }
++        GGML_LOG_INFO("%s: rank 0 waiting for %d peer(s) on port %d\n", __func__, world - 1, port);
++        for (int r = 1; r < world; ++r) {
++            int c = accept(srv, nullptr, nullptr);
++            if (c < 0) { GGML_LOG_ERROR("%s: accept failed\n", __func__); close(srv); return false; }
++            ssize_t sent = 0;
++            while (sent < (ssize_t) sizeof(id)) {
++                ssize_t n = write(c, (const char *) &id + sent, sizeof(id) - sent);
++                if (n <= 0) { GGML_LOG_ERROR("%s: id send failed\n", __func__); close(c); close(srv); return false; }
++                sent += n;
++            }
++            close(c);
++        }
++        close(srv);
++    } else {
++        int c = -1;
++        for (int attempt = 0; attempt < 600; ++attempt) {   // retry up to ~60s: rank 0 may not be up yet
++            c = socket(AF_INET, SOCK_STREAM, 0);
++            sockaddr_in addr = {};
++            addr.sin_family = AF_INET;
++            addr.sin_port   = htons((uint16_t) port);
++            inet_pton(AF_INET, ip, &addr.sin_addr);
++            if (connect(c, (sockaddr *) &addr, sizeof(addr)) == 0) {
++                break;
++            }
++            close(c);
++            c = -1;
++            usleep(100 * 1000);
++        }
++        if (c < 0) {
++            GGML_LOG_ERROR("%s: could not reach rank 0 at %s:%d\n", __func__, ip, port);
++            return false;
++        }
++        ssize_t got = 0;
++        while (got < (ssize_t) sizeof(id)) {
++            ssize_t n = read(c, (char *) &id + got, sizeof(id) - got);
++            if (n <= 0) { GGML_LOG_ERROR("%s: id recv failed\n", __func__); close(c); return false; }
++            got += n;
++        }
++        close(c);
++    }
++
++    ggml_cuda_set_device(0);
++    ncclResult_t rc = ncclCommInitRank(&g_world_comm, world, id, rank);
++    if (rc != ncclSuccess) {
++        GGML_LOG_ERROR("%s: ncclCommInitRank failed: %s\n", __func__, ncclGetErrorString(rc));
++        g_world_comm = nullptr;
++        return false;
++    }
++    g_world_rank = rank;
++    g_world_size = world;
++    GGML_LOG_INFO("%s: world communicator up: rank %d/%d (master %s:%d)\n", __func__, rank, world, ip, port);
++    return true;
++}
++#endif // GGML_USE_NCCL
++
++static bool ggml_cuda_world_available(void) {
++#ifdef GGML_USE_NCCL
++    return g_world_comm != nullptr || ggml_cuda_world_configured();
++#else
++    return false;
++#endif // GGML_USE_NCCL
++}
++
++bool ggml_backend_cuda_world_init(void) {
++#ifdef GGML_USE_NCCL
++    return ggml_cuda_world_init_once();
++#else
++    return false;
++#endif // GGML_USE_NCCL
++}
++
+ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * ret) {
+ #ifdef GGML_USE_NCCL
+     // Disabling NCCL path when CUDA virtual devices are in use since NCCL requires one distinct physical GPU per rank.
+@@ -2134,6 +2280,29 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+                     return false;
+             }
+             break;
++        case GGML_OP_ALLREDUCE:
++            {
++#ifdef GGML_USE_NCCL
++                const ggml_tensor * src0 = dst->src[0];
++                if (!ggml_cuda_world_init_once()) {
++                    GGML_LOG_ERROR("%s: GGML_OP_ALLREDUCE needs the world communicator (set GGML_NCCL_RANK/WORLD/MASTER)\n", __func__);
++                    return false;
++                }
++                const int64_t ne = ggml_nelements(dst);
++                ncclDataType_t dt;
++                switch (dst->type) {
++                    case GGML_TYPE_F32:  dt = ncclFloat;    break;
++                    case GGML_TYPE_F16:  dt = ncclHalf;     break;
++                    case GGML_TYPE_BF16: dt = ncclBfloat16; break;
++                    default:
++                        return false;
++                }
++                NCCL_CHECK(ncclAllReduce(src0->data, dst->data, ne, dt, ncclSum, g_world_comm, ctx.stream()));
++#else
++                return false;
++#endif // GGML_USE_NCCL
++            }
++            break;
+         case GGML_OP_GLU:
+             switch (ggml_get_glu_op(dst)) {
+                 case GGML_GLU_OP_REGLU:
+@@ -2505,6 +2674,16 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+             continue;
+         }
+ 
++        // GGML_OP_ALLREDUCE runs a blocking cross-process NCCL/RCCL collective that
++        // cannot be captured into a CUDA/HIP graph (the ranks must rendezvous at run
++        // time). Fall back to eager execution whenever an allreduce node is present.
++        if (node->op == GGML_OP_ALLREDUCE) {
++            use_cuda_graph = false;
++#ifndef NDEBUG
++            GGML_LOG_DEBUG("%s: disabling CUDA graphs: GGML_OP_ALLREDUCE present\n", __func__);
++#endif
++        }
++
+         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
+         if (node->op == GGML_OP_MUL_MAT_ID) {
+             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+@@ -4747,6 +4926,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+                     return false;
+             }
+             break;
++        case GGML_OP_ALLREDUCE:
++            return ggml_cuda_world_available() &&
++                   op->src[0]->type == op->type &&
++                   (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16);
+         case GGML_OP_GLU:
+             switch (ggml_get_glu_op(op)) {
+                 case GGML_GLU_OP_REGLU:
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index d380577..0f91a73 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -1019,7 +1019,10 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
+         result->buffer = nullptr;
+     }
+ 
+-    if (result->buffer) {
++    // Empty tensors (a zero-sized slice from -sm tensor tensor-parallel splitting) can carry a
++    // data pointer that legitimately lands past the buffer end — nothing is read/written, so the
++    // bounds check below does not apply. Skipping it is what unbreaks -sm tensor over RPC.
++    if (result->buffer && !ggml_is_empty(result)) {
+         // require that the tensor data does not go beyond the buffer end
+         uint64_t tensor_size = (uint64_t) ggml_nbytes(result);
+         uint64_t buffer_start = (uint64_t) ggml_backend_buffer_get_base(result->buffer);
+diff --git a/ggml/src/ggml-rpc/transport.cpp b/ggml/src/ggml-rpc/transport.cpp
+index a728152..c1798d5 100644
+--- a/ggml/src/ggml-rpc/transport.cpp
++++ b/ggml/src/ggml-rpc/transport.cpp
+@@ -44,6 +44,9 @@ static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
+ #ifdef GGML_RPC_RDMA
+ static constexpr size_t RDMA_CHUNK    = 256 * 1024;   // 256 KiB per send/recv (fits default 8 MiB memlock)
+ static constexpr int    RDMA_RX_DEPTH = 24;            // pre-posted recv ring: 24 × 256 KiB = 6 MiB
++static constexpr int    RDMA_TX_DEPTH = 2;             // in-flight send window (thunderbolt_ibverbs QP flushes with >2 outstanding)
++                                                       // (rx 6 MiB + tx 1.25 MiB stays under the 8 MiB memlock default;
++                                                       //  window < RDMA_RX_DEPTH so the receiver ring cannot overrun)
+ static constexpr size_t RDMA_GID_SIZE = 16;            // RoCE GID / IB GID is always 16 bytes
+ using rdma_gid_t = std::array<uint8_t, RDMA_GID_SIZE>;
+ 
+@@ -67,6 +70,10 @@ struct rdma_conn {
+         return static_cast<uint8_t *>(rx_buf) + static_cast<size_t>(i) * RDMA_CHUNK;
+     }
+ 
++    uint8_t * tx_slot(int i) const {
++        return static_cast<uint8_t *>(tx_buf) + static_cast<size_t>(i) * RDMA_CHUNK;
++    }
++
+     bool post_rx(int i) {
+         struct ibv_sge sge = {};
+         sge.addr   = (uintptr_t)rx_slot(i);
+@@ -283,7 +290,7 @@ bool socket_t::impl::rdma_probe() {
+     qia.send_cq = rdma->scq;
+     qia.recv_cq = rdma->rcq;
+     qia.qp_type = IBV_QPT_RC;
+-    qia.cap.max_send_wr     = 4;
++    qia.cap.max_send_wr     = RDMA_TX_DEPTH + 2;
+     qia.cap.max_recv_wr     = RDMA_RX_DEPTH + 4;
+     qia.cap.max_send_sge    = 1;
+     qia.cap.max_recv_sge    = 1;
+@@ -293,11 +300,12 @@ bool socket_t::impl::rdma_probe() {
+     if (!rdma->qp) return false;
+     rdma->max_inline = qia.cap.max_inline_data;
+ 
+-    rdma->tx_buf = aligned_alloc(4096, RDMA_CHUNK);
++    rdma->tx_buf = aligned_alloc(4096, static_cast<size_t>(RDMA_TX_DEPTH) * RDMA_CHUNK);
+     rdma->rx_buf = aligned_alloc(4096, static_cast<size_t>(RDMA_RX_DEPTH) * RDMA_CHUNK);
+     if (!rdma->tx_buf || !rdma->rx_buf) return false;
+ 
+-    rdma->tx_mr = ibv_reg_mr(rdma->pd, rdma->tx_buf, RDMA_CHUNK, IBV_ACCESS_LOCAL_WRITE);
++    rdma->tx_mr = ibv_reg_mr(rdma->pd, rdma->tx_buf, static_cast<size_t>(RDMA_TX_DEPTH) * RDMA_CHUNK,
++                           IBV_ACCESS_LOCAL_WRITE);
+     rdma->rx_mr = ibv_reg_mr(rdma->pd, rdma->rx_buf, static_cast<size_t>(RDMA_RX_DEPTH) * RDMA_CHUNK,
+                            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+     if (!rdma->tx_mr || !rdma->rx_mr) return false;
+@@ -402,37 +410,45 @@ bool socket_t::impl::rdma_poll(struct ibv_cq * cq, struct ibv_wc * wc) {
+     }
+ }
+ 
++// Pipelined sender: keep up to RDMA_TX_DEPTH chunks in flight through a ring of
++// registered bounce buffers, so the memcpy of chunk N+1 overlaps the wire time
++// of chunk N. Correctness of slot reuse relies on RC ordering: completions are
++// delivered in posting order and the in-flight window never exceeds the ring
++// depth, so by the time seq wraps back to a slot its previous send has completed.
+ bool socket_t::impl::rdma_send(const void * data, size_t size) {
+     rdma_conn * c = rdma.get();
+     const uint8_t * src = (const uint8_t *)data;
+-    size_t rem = size;
+-    while (rem > 0) {
+-        size_t chunk = std::min(rem, RDMA_CHUNK);
+-
+-        struct ibv_sge sge = {};
+-        struct ibv_send_wr wr = {}, * bad = nullptr;
+-        wr.opcode  = IBV_WR_SEND;
+-        wr.sg_list = &sge;
+-        wr.num_sge = 1;
+-
+-        if (chunk <= c->max_inline) {
+-            sge.addr   = (uintptr_t)src;
+-            sge.length = chunk;
+-            wr.send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE;
+-        } else {
+-            memcpy(c->tx_buf, src, chunk);
+-            sge.addr   = (uintptr_t)c->tx_buf;
++    size_t   rem      = size;
++    int      inflight = 0;
++    uint64_t seq      = 0;
++    while (rem > 0 || inflight > 0) {
++        if (rem > 0 && inflight < RDMA_TX_DEPTH) {
++            size_t chunk = std::min(rem, RDMA_CHUNK);
++            int    slot  = (int)(seq % RDMA_TX_DEPTH);
++            memcpy(c->tx_slot(slot), src, chunk);
++
++            struct ibv_sge sge = {};
++            sge.addr   = (uintptr_t)c->tx_slot(slot);
+             sge.length = chunk;
+             sge.lkey   = c->tx_mr->lkey;
+-            wr.send_flags = IBV_SEND_SIGNALED;
+-        }
+ 
+-        if (ibv_post_send(c->qp, &wr, &bad) != 0) return false;
+-        struct ibv_wc wc;
+-        if (!rdma_poll(c->scq, &wc)) return false;
++            struct ibv_send_wr wr = {}, * bad = nullptr;
++            wr.wr_id      = seq;
++            wr.opcode     = IBV_WR_SEND;
++            wr.sg_list    = &sge;
++            wr.num_sge    = 1;
++            wr.send_flags = IBV_SEND_SIGNALED;
+ 
+-        src += chunk;
+-        rem -= chunk;
++            if (ibv_post_send(c->qp, &wr, &bad) != 0) return false;
++            src += chunk;
++            rem -= chunk;
++            seq++;
++            inflight++;
++        } else {
++            struct ibv_wc wc;
++            if (!rdma_poll(c->scq, &wc)) return false;
++            inflight--;
++        }
+     }
+     return true;
+ }
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index a7d1fe7..5012108 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -1098,9 +1098,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "OPT_STEP_SGD",
+ 
+     "GLU",
++
++    "ALLREDUCE",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
++static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1213,9 +1215,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "sgd(x)",
+ 
+     "glu(x)",
++
++    "allreduce(x)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
++static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -3579,6 +3583,22 @@ struct ggml_tensor * ggml_cont(
+     return ggml_cont_impl(ctx, a);
+ }
+ 
++// ggml_allreduce
++
++struct ggml_tensor * ggml_allreduce(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * a) {
++    GGML_ASSERT(ggml_is_contiguous(a));
++
++    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
++    ggml_format_name(result, "%s (allreduce)", a->name);
++
++    result->op     = GGML_OP_ALLREDUCE;
++    result->src[0] = a;
++
++    return result;
++}
++
+ // make contiguous, with new shape
+ GGML_API struct ggml_tensor * ggml_cont_1d(
+         struct ggml_context * ctx,
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 7a93b19..933f385 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -332,3 +332,10 @@ if (TARGET gguf-model-data)
+     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
+     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
+ endif()
++
++# cross-process world allreduce (NCCL/RCCL tensor parallelism over nodes)
++if (GGML_CUDA OR GGML_HIP)
++    add_executable(test-world-allreduce test-world-allreduce.cpp)
++    target_link_libraries(test-world-allreduce PRIVATE ggml ggml-rpc)
++    target_include_directories(test-world-allreduce PRIVATE ${PROJECT_SOURCE_DIR}/ggml/include)
++endif()
+diff --git a/tests/test-world-allreduce.cpp b/tests/test-world-allreduce.cpp
+new file mode 100644
+index 0000000..6e67cc1
+--- /dev/null
++++ b/tests/test-world-allreduce.cpp
+@@ -0,0 +1,186 @@
++// End-to-end test for GGML_OP_ALLREDUCE over the cross-process world communicator.
++//
++// Proves the core mechanism for cross-NODE tensor parallelism in llama.cpp:
++// the head process runs its graph on the local CUDA backend (world rank 0)
++// while shipping an identical graph to a remote ggml-rpc-server (world rank 1)
++// in ONE GRAPH_COMPUTE round trip; the two ranks rendezvous *inside* the
++// embedded allreduce nodes via NCCL/RCCL — no per-layer RPC round trips.
++//
++// Usage:
++//   peer:  GGML_NCCL_RANK=1 GGML_NCCL_WORLD=2 GGML_NCCL_MASTER=<head-ip>:29500 \
++//          ggml-rpc-server -H <peer-ip> -p 50052
++//   head:  GGML_NCCL_RANK=0 GGML_NCCL_WORLD=2 GGML_NCCL_MASTER=<head-ip>:29500 \
++//          test-world-allreduce --rpc <peer-ip>:50052 [--layers 60] [--iters 20] [--ne 6144]
++//
++// Local smoke mode (no env, no rpc): test-world-allreduce   -> builds the graph on
++// the CUDA backend and expects allreduce to fail gracefully (unsupported), exit 0.
++
++#include "ggml.h"
++#include "ggml-alloc.h"
++#include "ggml-backend.h"
++#include "ggml-cuda.h"
++#include "ggml-rpc.h"
++
++#include <chrono>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <thread>
++#include <vector>
++
++struct graph_bundle {
++    ggml_context *        ctx     = nullptr;
++    ggml_cgraph  *        graph   = nullptr;
++    ggml_tensor  *        input   = nullptr;
++    ggml_tensor  *        output  = nullptr;
++    ggml_backend_buffer_t buffer  = nullptr;
++};
++
++// input -> [ allreduce -> scale(0.5) ] x layers.
++// With rank0=1.0 and rank1=2.0 the value is 3.0 after each allreduce and 1.5
++// after each scale -> steady state; final output must be 1.5 on both ranks.
++static graph_bundle build_graph(ggml_backend_t backend, int64_t ne, int layers) {
++    graph_bundle b;
++
++    ggml_init_params ip = {
++        /*.mem_size   =*/ ggml_tensor_overhead() * (size_t)(layers * 2 + 8) + ggml_graph_overhead_custom(layers * 2 + 8, false),
++        /*.mem_buffer =*/ nullptr,
++        /*.no_alloc   =*/ true,
++    };
++    b.ctx = ggml_init(ip);
++
++    b.input = ggml_new_tensor_1d(b.ctx, GGML_TYPE_F32, ne);
++    ggml_set_name(b.input, "in");
++
++    ggml_tensor * cur = b.input;
++    for (int l = 0; l < layers; ++l) {
++        cur = ggml_allreduce(b.ctx, cur);
++        cur = ggml_scale(b.ctx, cur, 0.5f);
++    }
++    b.output = cur;
++    ggml_set_name(b.output, "out");
++
++    b.graph = ggml_new_graph_custom(b.ctx, layers * 2 + 8, false);
++    ggml_build_forward_expand(b.graph, b.output);
++
++    b.buffer = ggml_backend_alloc_ctx_tensors(b.ctx, backend);
++    if (b.buffer == nullptr) {
++        fprintf(stderr, "FATAL: failed to allocate tensors on backend %s\n", ggml_backend_name(backend));
++        exit(1);
++    }
++    return b;
++}
++
++static void fill_input(graph_bundle & b, float v, int64_t ne) {
++    std::vector<float> host(ne, v);
++    ggml_backend_tensor_set(b.input, host.data(), 0, ne * sizeof(float));
++}
++
++int main(int argc, char ** argv) {
++    const char * rpc_endpoint = nullptr;
++    int     layers = 60;
++    int     iters  = 20;
++    int64_t ne     = 6144;
++
++    for (int i = 1; i < argc; ++i) {
++        if (!strcmp(argv[i], "--rpc")    && i + 1 < argc) { rpc_endpoint = argv[++i]; }
++        else if (!strcmp(argv[i], "--layers") && i + 1 < argc) { layers = atoi(argv[++i]); }
++        else if (!strcmp(argv[i], "--iters")  && i + 1 < argc) { iters  = atoi(argv[++i]); }
++        else if (!strcmp(argv[i], "--ne")     && i + 1 < argc) { ne     = atoll(argv[++i]); }
++        else { fprintf(stderr, "unknown arg: %s\n", argv[i]); return 1; }
++    }
++
++    ggml_backend_t cuda = ggml_backend_cuda_init(0);
++    if (cuda == nullptr) {
++        fprintf(stderr, "FATAL: no CUDA/HIP backend\n");
++        return 1;
++    }
++
++    const bool world = getenv("GGML_NCCL_RANK") != nullptr;
++    if (!world) {
++        printf("no GGML_NCCL_RANK set: local smoke mode (graph build only)\n");
++        graph_bundle b = build_graph(cuda, ne, 1);
++        printf("graph with ALLREDUCE node built + allocated OK (op registered)\n");
++        ggml_backend_buffer_free(b.buffer);
++        ggml_free(b.ctx);
++        ggml_backend_free(cuda);
++        return 0;
++    }
++
++    // ---- each rank runs its own local graph; they rendezvous in the allreduce ----
++    // Distinct per-rank inputs so the correctness check is meaningful:
++    // rank r contributes (r+1). Sum over 2 ranks = 1+2 = 3, then *0.5 -> 1.5 steady state.
++    const int this_rank = atoi(getenv("GGML_NCCL_RANK"));
++    graph_bundle local = build_graph(cuda, ne, layers);
++    fill_input(local, (float)(this_rank + 1), ne);
++
++    ggml_backend_t rpc = nullptr;
++    graph_bundle remote;
++    if (rpc_endpoint != nullptr) {
++        rpc = ggml_backend_rpc_init(rpc_endpoint, 0);
++        if (rpc == nullptr) {
++            fprintf(stderr, "FATAL: cannot connect rpc %s\n", rpc_endpoint);
++            return 1;
++        }
++        remote = build_graph(rpc, ne, layers);
++        fill_input(remote, 2.0f, ne);
++        printf("remote graph allocated on %s (%d allreduce nodes)\n", rpc_endpoint, layers);
++    }
++
++    printf("world run: layers=%d iters=%d ne=%lld (%.1f KB/allreduce)\n",
++           layers, iters, (long long) ne, ne * 4.0 / 1024.0);
++
++    // warmup + correctness (1 iteration)
++    {
++        std::thread rt;
++        if (rpc) {
++            rt = std::thread([&] { ggml_backend_graph_compute(rpc, remote.graph); });
++        }
++        ggml_status st = ggml_backend_graph_compute(cuda, local.graph);
++        if (rt.joinable()) rt.join();
++        if (st != GGML_STATUS_SUCCESS) {
++            fprintf(stderr, "FATAL: local graph_compute failed\n");
++            return 1;
++        }
++        std::vector<float> out(ne);
++        ggml_backend_tensor_get(local.output, out.data(), 0, ne * sizeof(float));
++        const float expect = 1.5f;   // (1+2) * 0.5, steady state
++        if (fabsf(out[0] - expect) > 1e-3f || fabsf(out[ne-1] - expect) > 1e-3f) {
++            fprintf(stderr, "FAIL: local out=%f/%f expect=%f (allreduce broken)\n", out[0], out[ne-1], expect);
++            return 1;
++        }
++        if (rpc) {
++            std::vector<float> rout(ne);
++            ggml_backend_tensor_get(remote.output, rout.data(), 0, ne * sizeof(float));
++            if (fabsf(rout[0] - expect) > 1e-3f) {
++                fprintf(stderr, "FAIL: remote out=%f expect=%f\n", rout[0], expect);
++                return 1;
++            }
++        }
++        printf("CORRECTNESS OK: both ranks reduced to %.2f\n", 1.5f);
++    }
++
++    // timing
++    auto t0 = std::chrono::steady_clock::now();
++    for (int it = 0; it < iters; ++it) {
++        std::thread rt;
++        if (rpc) {
++            rt = std::thread([&] { ggml_backend_graph_compute(rpc, remote.graph); });
++        }
++        ggml_backend_graph_compute(cuda, local.graph);
++        if (rt.joinable()) rt.join();
++    }
++    auto t1 = std::chrono::steady_clock::now();
++    const double sec = std::chrono::duration<double>(t1 - t0).count();
++    const double per_graph = sec / iters * 1000.0;
++    const double per_ar    = sec / iters / layers * 1e6;
++
++    printf("RESULT: %.2f ms/graph (%d allreduces)  ->  %.0f us/allreduce  [incl. 1 RPC round trip/graph]\n",
++           per_graph, layers, per_ar);
++
++    if (rpc) ggml_backend_free(rpc);
++    ggml_backend_free(cuda);
++    return 0;
++}

@@ -1,0 +1,21 @@
+# build artifacts
+build/
+*.o
+*.so
+*.so.*
+*.a
+
+# models / weights (never commit)
+*.gguf
+models/
+
+# logs / scratch
+*.log
+/tmp/
+rocm-systems/
+rocm-runtime-bundle/
+
+# editor / os
+.vscode/
+.idea/
+.DS_Store
