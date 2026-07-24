@@ -28,7 +28,7 @@ RPC work at all** (see below).
 | model | `-sm layer` (pipeline) | `-sm tensor` butterfly | `-sm tensor` **RCCL (this)** |
 |---|---|---|---|
 | Qwen3.5-2B Q8_0 | 70.98 | 19.35 | 19.28 *(break-even — 2B too small, per-sync overhead dominates)* |
-| Huihui-Qwen3.6-27B Q6_K | **8.87** | 3.10 / 3.56 | **3.65 / 4.02 (+13–18%)** |
+| Qwen3.6-27B Q6_K | **8.87** | 3.10 / 3.56 | **3.65 / 4.02 (+13–18%)** |
 
 *(27B shows both sessions: original / fresh post-bond-repair. Numbers move with bond contention;
 the RCCL-beats-butterfly margin held both times.)*
