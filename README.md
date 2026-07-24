@@ -18,21 +18,31 @@ RPC work at all** (see below).
 
 | | |
 |---|---|
-| ✅ **Tested** | 2× Strix Halo gfx1151, Thunderbolt/USB4 bond, **TCP**. Correct (`reduced to 1.50`), +18% vs butterfly on 27B. |
+| ✅ **Tested** | 2× Strix Halo gfx1151, Thunderbolt/USB4 bond, **TCP**. Correct (`reduced to 1.50`); RCCL beats butterfly on 27B (**+7–18%**, re-verified **+13% clean**). RCCL confirmed binding the bond — `NCCL_DEBUG=INFO`: `NET/Socket : Using [0]bond0:10.4.0.1`. |
 | ⏳ **Pending hardware** | ConnectX RDMA NIC. The port is transport-agnostic — RCCL auto-uses IB verbs when present (`NCCL_IB_DISABLE=0`). RDMA (~5 µs/op vs TCP's ~286 µs) is what should tip TP past pipeline. |
 
 ## Measured (2 nodes, bond, TCP, in-container ROCm 7.14)
 
+`-n` tokens/s (`tg`), `-sm tensor -ts 50/50 -ngl 99`, two independent A/B sessions:
+
 | model | `-sm layer` (pipeline) | `-sm tensor` butterfly | `-sm tensor` **RCCL (this)** |
 |---|---|---|---|
 | Qwen3.5-2B Q8_0 | 70.98 | 19.35 | 19.28 *(break-even — 2B too small, per-sync overhead dominates)* |
-| Huihui-Qwen3.6-27B Q6_K | **8.87** | 3.10 | **3.65 (+18%)** |
+| Huihui-Qwen3.6-27B Q6_K | **8.87** | 3.10 / 3.56 | **3.65 / 4.02 (+13–18%)** |
+
+*(27B shows both sessions: original / fresh post-bond-repair. Numbers move with bond contention;
+the RCCL-beats-butterfly margin held both times.)*
 
 Primitive: **286 µs/all-reduce** over the bond (== torch.distributed, i.e. native RCCL-over-TCP floor).
+RCCL's transport confirmed on the bond via `NCCL_DEBUG=INFO`: `NET/Socket : Using [0]bond0:10.4.0.1`.
+
+**Capacity proof (mainline, not this port):** a **298B hy_v3 MoE (IQ2_M, 95 GiB)** tensor-parallels across
+the two nodes at **1.78 t/s** (`-sm tensor -ts 50/50 -mmp 0`) — i.e. the 2-node setup runs models far too
+big for one 96 GB carve. Requires the `-mmp 0` fix below.
 
 ### Read it honestly
-- The port **works end-to-end** and **beats the butterfly by +18% on the 27B** (bigger tensors let the
-  collective's efficiency show).
+- The port **works end-to-end** and **beats the butterfly on the 27B** (+13–18% across sessions; bigger
+  tensors let the collective's efficiency show).
 - **Pipeline (`-sm layer`) is still the fastest cross-node path over TCP** — TP all-reduces *every* layer,
   and that per-sync cost dominates regardless of butterfly-vs-RCCL. The RCCL win is *within* the TP path,
   not vs pipeline. Overtaking pipeline needs the ~5 µs RDMA floor, not the ~286 µs TCP one.
@@ -72,6 +82,22 @@ cmake --build build --target llama-bench ggml-rpc-server -j$(nproc)
 For **RDMA** (when the NIC lands): add `libibverbs`/`libmlx5` (rdma-core) to the container, set
 `NCCL_IB_DISABLE=0 NCCL_IB_HCA=<mlx5 dev>`, and confirm `NCCL_DEBUG=INFO` prints `NET/IB` not `NET/Socket`.
 No code change — the collective is transport-agnostic.
+
+## Gotchas that matter on Strix Halo (cost real debugging time)
+
+- **Large models (>~100 GiB) over RPC: use `-mmp 0` / `--no-mmap`.** With mmap on, `llama-cli`/`llama-server`
+  **hang at 0% GPU or crash with a HIP/HSA fault** while loading — the kernel `mmap`s the model and the HIP
+  runtime's GPU-buffer allocation collides on the UMA address space (upstream [#19745](https://github.com/ggml-org/llama.cpp/issues/19745)).
+  `--no-mmap` reads straight to GPU buffers and fixes it. `llama-bench` uses `-mmp 0`. (This is what made the
+  298B hy_v3 run above possible — same stall hit *both* `-sm tensor` and `-sm layer` until mmap was off.)
+- **Aggregated (bonded) Thunderbolt link: set `net.ipv4.tcp_reordering=127`** (+ larger `rmem_max`/`wmem_max`).
+  `balance-rr` sends packets round-robin across both links → out-of-order arrival; the default `tcp_reordering=3`
+  treats that as loss and throughput collapses to a single link. **It resets to 3 on reboot** — persist it in
+  `/etc/sysctl.d/`. Verify aggregation with `iperf3` (should ~2× a single link) and per-slave TX counters.
+- **Runtime:** the container's `/opt/rocm` librccl **segfaults standalone**; the `_rocm_sdk_libraries_gfx1151`
+  one works — put it first on `LD_LIBRARY_PATH` (see `docs/REPRODUCE.md`). `NCCL_CUMEM_ENABLE=0` is required.
+- **rpc-server** must bind `0.0.0.0` (not the node IP) and launch via `exec` (a `sleep infinity` container can
+  orphan a `&`-backgrounded server when `podman exec -d` returns).
 
 ## The port, in one screen (details in docs/REPRODUCE.md)
 
