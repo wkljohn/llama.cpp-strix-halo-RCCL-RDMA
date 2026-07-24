@@ -7,6 +7,24 @@ RPC round-trips. This adds a `GGML_OP_ALLREDUCE` graph op backed by a cross-proc
 world communicator**, so the collective rendezvouses *inside* RCCL — one `GRAPH_COMPUTE`/token instead
 of ~120 per-op round-trips. Built and tested on 2× AMD Strix Halo (gfx1151) over a Thunderbolt/USB4 bond.
 
+## What works today ✅
+
+- **Correct cross-node RCCL all-reduce** — 2-rank proof `reduced to 1.50`; 286 µs/op, matching
+  `torch.distributed` (i.e. it hits the native RCCL-over-TCP floor, no overhead added).
+- **Beats the host butterfly** on the 27B: **+13–18%** across two independent sessions (RCCL 4.02 vs
+  butterfly 3.56 clean). The collective is genuinely faster than GET/SET round-trips.
+- **Runs models too big for one node** — a **298B hy_v3 MoE (95 GiB)** tensor-parallels across the two
+  nodes at **1.78 t/s**. That's the point of cross-node TP: capacity a single 96 GB carve can't hold.
+- **Two upstream bug fixes** that make `-sm tensor` over RPC work *at all* (zero-sized-slice crash;
+  dispatch-order deadlock) — useful independent of the collective.
+- **RDMA-ready, no code change** — the collective is transport-agnostic; RCCL auto-selects IB verbs when a
+  NIC is present.
+
+**⏳ The RDMA test is pending hardware — and it's the headline number, not a footnote.** Over TCP the
+per-layer sync cost (286 µs/op) is what keeps TP from beating pipeline; RDMA drops that to **~5 µs/op**
+(~50×), which is what should tip TP-RCCL *past* pipeline. So the TCP results below **prove correctness and
+the collective win — they are the pre-RDMA baseline, not the ceiling.** The ceiling is a $-few NIC away.
+
 ## Why this exists (the differentiator)
 
 Mainline llama.cpp shipped NCCL/RCCL tensor parallelism in Apr 2026 (build b8738) — but it's **local
