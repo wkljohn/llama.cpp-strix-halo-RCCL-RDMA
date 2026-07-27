@@ -504,3 +504,60 @@ several reload cycles the IP bond between the nodes stopped passing traffic in b
 i.e. the Thunderbolt fabric was fine but the network driver had desynced. Recovering that
 needed a reboot. Fixing BUG 1 properly (patch above) removes the need for the reload entirely
 and is the highest-value change for anyone trying to use this transport in anger.
+
+---
+
+# ⚠ HAZARD — repeated module reloads can wedge the USB4 controller *and* the GPU
+
+**Severity: critical.** This is a hardware-integrity issue, not an inconvenience. Observed on
+both nodes after several `rmmod odl_tb5 / thunderbolt_net / thunderbolt` + `modprobe` cycles
+(the BUG 1 workaround). On the *following* boot:
+
+```
+amdgpu 0000:c5:00.0: psp reg (0x16080) wait timed out
+amdgpu 0000:c5:00.0: PSP create ring failed! / PSP firmware loading failed
+amdgpu 0000:c5:00.0: hw_init of IP block <psp> failed -22
+amdgpu 0000:c5:00.0: Fatal error during GPU init
+amdgpu 0000:c5:00.0: probe with driver amdgpu failed with error -22
+thunderbolt 0000:c7:00.6: probe with driver thunderbolt failed with error -110
+BUG: kernel NULL pointer dereference
+```
+
+and on the peer, the mechanism is explicit:
+
+```
+thunderbolt 0000:c8:00.6: AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x0043
+                                                address=0xecce8000 flags=0x0020]
+```
+
+**An IOMMU page fault on the Thunderbolt controller** — i.e. the NHI DMA engine was still
+armed and wrote into unmapped memory while the controller was being torn down. That wedges
+the USB4 router, and (because they share the same power/firmware domain on Strix Halo) the
+GPU's PSP fails to load its firmware on the next boot, so **amdgpu does not come up at all**.
+Recovery required a full power cycle.
+
+### Why this happens
+`odl_tb5_remove()` cancels work items and calls `odl_tb5_rings_stop()`, but the ring
+teardown is not ordered against in-flight NHI DMA, and (BUG 1) the XDomain paths are not
+always disabled first. Unloading `thunderbolt` underneath a driver whose rings may still be
+live is therefore unsafe.
+
+### Practical rules until this is fixed upstream
+1. **Do not loop `rmmod`/`modprobe` on this stack.** Treat each reload as risky.
+2. **Always unbind the odl services and let the link go DISCONNECTED before unloading**, so
+   paths are torn down while the Thunderbolt core is still present:
+   ```bash
+   for s in $(ls /sys/bus/thunderbolt/drivers/odl_tb5/ | grep -E '^[01]-'); do
+       echo $s | sudo tee /sys/bus/thunderbolt/drivers/odl_tb5/unbind >/dev/null; done
+   sleep 2 && sudo rmmod odl_tb5      # only then
+   ```
+3. **Prefer a clean reboot over a stack reload** when the link is already unhealthy — the
+   reload is only safe from a *good* state, which is precisely when you do not need it.
+4. If a boot shows `PSP firmware loading failed` / `amdgpu probe failed -22`, the machine
+   needs a **full power cycle** (not a warm reboot) to reset the firmware domain.
+
+### Correction to BUG 1's "no-reboot workaround"
+The workaround does free leaked hop-IDs and *does* work from a healthy state, but repeating
+it is what produced the wedge above. It should be used **once**, not as a routine recovery
+step. The real fix is the BUG 1 patch (release paths on every teardown path) plus ordering
+ring teardown against in-flight DMA.
