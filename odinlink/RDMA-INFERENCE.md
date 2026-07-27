@@ -1,5 +1,26 @@
 # RDMA-over-Thunderbolt for llama.cpp inference — working recipe
 
+> ## ✅ OdinLink now runs the 27B end-to-end — and is the fastest cross-node path measured
+>
+> ```
+> | qwen35 27B Q6_K | 20.88 GiB | 27.32 B | ROCm,RPC | 99 | pp512 | 290.03 ± 61.04 |
+> | qwen35 27B Q6_K | 20.88 GiB | 27.32 B | ROCm,RPC | 99 | tg128 |   9.17 ± 0.00 |
+> ```
+>
+> | 27B Q6_K, 2 nodes `-sm layer` | pp512 | tg128 | vs TCP |
+> |---|---|---|---|
+> | **RDMA (OdinLink + patches here)** | 290.03 ± 61.04 | **9.17 ± 0.00** | **+3.9 %** |
+> | RDMA (thunderbolt_ibverbs) | 290.23 ± 61.80 | 9.07 ± 0.01 | +2.7 % |
+> | TCP | 292.11 ± 62.37 | 8.83 ± 0.03 | — |
+>
+> Transport integrity is independently verified, not inferred from "the benchmark
+> finished": `odl_rdma_stress --bidir` moves 2 GiB **each way** and checks every
+> byte — 8192/8192 messages verified on both peers at **9.83 Gb/s full duplex**.
+> That matters, because `llama-bench` measures speed and not correctness, so a
+> corrupting transport still prints a plausible t/s (it did, before the
+> bounce-buffer fix).
+
+
 **Status: WORKING.** Two Strix Halo nodes running llama.cpp cross-node inference with the
 RPC transport carrying tensor traffic over **RDMA on the Thunderbolt/USB4 cable**, no NIC.
 
@@ -578,3 +599,44 @@ MSG_END. That is precisely the signature above.
 
 Until (1) exists, a 20.88 GiB model transfer is a coin flip: it needs ~86 000
 messages and ~5.5 million fragments to arrive without a single loss.
+
+
+---
+
+# Bidirectional deadlock — the last blocker (FIXED)
+
+Unidirectional bulk ran 21 GiB flawlessly while llama.cpp died on the 27B. The
+distinguishing property is that ggml-rpc is **request/response on one QP**, so
+both peers send and receive concurrently. `odl_rdma_stress --bidir` reproduces
+that in ~25 s and found three separate causes:
+
+1. **ABBA lock inversion.** Draining the receive queue from `ibv_poll_cq()` meant
+   two threads polling *different* CQs both entered `odl_rq_drain`, which posts
+   completions into the *other* CQ — opposite lock orders. Receive progress now
+   belongs to a **dedicated per-QP RX thread**, independent of who polls what.
+   TX and RX are separate engines, as on real hardware.
+
+2. **One stream served both directions.** The RCCL plugin — the only consumer
+   known to work — opens a *separate* stream per direction and never shares one
+   (`listen`=recv stream, `connect`=send stream, `is_send` flag). Each QP now
+   opens two: `rx_stream` (advertised as `qp_num`, so the peer's
+   `IBV_QP_DEST_QPN` names where we receive) and `tx_stream`.
+
+3. **Reserve sized as if it were the RX ring.** `TX_POOL_RESERVE=2048` against
+   `rx_target=2048` of a 4096-frame pool left `free_count == reserve` exactly,
+   and `can_send()` tests `free > reserve` — TX blocked forever on a healthy
+   link. The driver diagnostic printed it verbatim:
+   `can_send=0 state=4 free=2048 reserve=2048`. The reserve is a *floor* for RX
+   repost, not the ring size; 256 leaves TX ~1700 frames.
+
+Teardown was fixed alongside: `destroy_qp` now joins the RX thread (it kept
+draining into a freed QP) and frees bounce buffers for untransmitted WRs.
+
+## Method note
+
+Three of the changes made while chasing this were hypothesis-driven and two of
+them made things *worse* (the oversized reserve deadlocked TX outright; draining
+from `poll_cq` introduced the ABBA). The reliable progress came from two things
+only: a test that reproduces the real access pattern in seconds and verifies
+every byte, and a driver diagnostic that prints the failing arithmetic. Build
+those first.

@@ -26,10 +26,64 @@ index 229abc5..af1f3b8 100644
  
  	/* Per-stream readability: check if any stream has pending RX */
 diff --git a/driver/odl_tb5_core.h b/driver/odl_tb5_core.h
-index 40670d0..e41653a 100644
+index 40670d0..0258d09 100644
 --- a/driver/odl_tb5_core.h
 +++ b/driver/odl_tb5_core.h
-@@ -245,6 +245,11 @@ struct odl_tb5_device {
+@@ -72,13 +72,41 @@ struct odl_tb5_stream_hdr {
+ 	__u8   src_id;
+ 	__u8   dst_id;
+ 	__u8   flags;
++	__u8   reserved;	/* pad: lands the payload 8-byte aligned */
+ 	__le16 payload_len;
++	__le16 frag_idx;	/* fragment index within the message, from 0 */
+ } __packed;
+ 
+ /* ── DMA frame pool (replaces old double-buffer scheme) ─────────────── */
+ 
+-#define ODL_TB5_FRAME_POOL_SIZE		1024
+-#define ODL_TB5_TX_POOL_RESERVE		64  /* keep free for RX repost */
++/*
++ * The frame pool is SHARED between TX and RX repost, so it must comfortably
++ * back the peer's pre-posted receive ring or bidirectional traffic starves RX
++ * and the NHI drops inbound frames in bursts.
++ *
++ * Sizing, for the ggml-rpc transport (the most demanding consumer here):
++ *   256 KiB message / 4024 B payload  = 66 frames per message
++ *   24 pre-posted receives            = 1587 frames of RX ring
++ * The old 1024-frame pool was smaller than the RX ring alone, and the 64-frame
++ * "reserve for RX" was less than a SINGLE message - so a busy sender routinely
++ * left nothing for repost. Observed as 32-fragment burst losses under
++ * bidirectional load.
++ *
++ * 4096 frames = 16 MiB per device; the reserve now guarantees the full RX ring
++ * can always be reposted no matter how hard TX is pushing. Pure memory: no
++ * extra work per frame, so the latency path is unaffected (and it removes
++ * stalls waiting for free frames).
++ */
++#define ODL_TB5_FRAME_POOL_SIZE		4096
++/*
++ * The reserve is a floor TX may not dig below, NOT the size of the RX ring.
++ * rx_target already claims pool/2 (2048) for posted receives, so setting the
++ * reserve to 2048 as well left free_count == reserve exactly and
++ * odl_tb5_stream_can_send() (free > reserve) was false forever - TX deadlocked
++ * with a healthy link. Keep it a small guard so RX repost can always obtain a
++ * few frames, while leaving TX ~1700 frames (~26 x 256 KiB messages) of room.
++ */
++#define ODL_TB5_TX_POOL_RESERVE		256  /* floor kept free for RX repost */
+ #define ODL_TB5_POLL_INTERVAL_NS	(10 * 1000)  /* 10 us */
+ 
+ /* ── SG batch buffer pool (throughput mode) ──────────────────────────── */
+@@ -183,6 +211,9 @@ struct odl_tb5_stream {
+ 	size_t			rx_asm_len;
+ 	size_t			rx_asm_cap;
+ 	u8			rx_asm_src_id;
++	u16			rx_asm_next_frag;
++	bool			rx_asm_bad;
++	atomic_t		rx_frag_drops;
+ 
+ 	struct kref		refcount;
+ 	struct hlist_node	node;
+@@ -245,6 +276,11 @@ struct odl_tb5_device {
  	bool			login_sent;
  	bool			login_received;
  	int			stale_remote_tx_hopid;
@@ -41,7 +95,7 @@ index 40670d0..e41653a 100644
  
  	/* DMA verification (ping/pong) */
  	struct work_struct	verify_work;
-@@ -252,6 +257,12 @@ struct odl_tb5_device {
+@@ -252,6 +288,12 @@ struct odl_tb5_device {
  	struct hrtimer		rx_poll_timer;
  	wait_queue_head_t	verify_waitq;
  	bool			pong_received;
@@ -237,10 +291,50 @@ index 1c1bc38..d849e54 100644
  	mutex_lock(&dev->state_lock);
  	dev->state = ODL_TB5_STATE_HANDSHAKE;
 diff --git a/driver/odl_tb5_ring_dma.c b/driver/odl_tb5_ring_dma.c
-index aaae32d..84c03d1 100644
+index aaae32d..d35c889 100644
 --- a/driver/odl_tb5_ring_dma.c
 +++ b/driver/odl_tb5_ring_dma.c
-@@ -289,6 +289,9 @@ void odl_tb5_rx_callback(struct tb_ring *ring,
+@@ -270,6 +270,8 @@ void odl_tb5_rx_callback(struct tb_ring *ring,
+ 							data + ODL_TB5_STREAM_HDR_SIZE;
+ 						u8 flags = shdr->flags;
+ 
++						u16 fidx = le16_to_cpu(shdr->frag_idx);
++
+ 						/* Start of new message — reset assembly */
+ 						if (flags & ODL_TB5_SHDR_F_MSG_START) {
+ 							kfree(stream->rx_asm_buf);
+@@ -277,7 +279,30 @@ void odl_tb5_rx_callback(struct tb_ring *ring,
+ 							stream->rx_asm_len = 0;
+ 							stream->rx_asm_cap = 0;
+ 							stream->rx_asm_src_id = shdr->src_id;
++							stream->rx_asm_next_frag = 0;
++							stream->rx_asm_bad = false;
++						}
++
++						/*
++						 * Fragment sequencing: one compare, no
++						 * round-trips, so the latency path is
++						 * untouched (a SINGLE frame is always
++						 * fidx 0 and trivially valid). Without
++						 * this a dropped frame was invisible and
++						 * silently produced a short, corrupt
++						 * message. On a gap, poison the message
++						 * and drop it at MSG_END rather than
++						 * handing up bad data.
++						 */
++						if (fidx != stream->rx_asm_next_frag) {
++							if (!stream->rx_asm_bad)
++								pr_warn_ratelimited("odl_tb5: stream %u fragment gap: got %u expected %u - dropping message\n",
++										    dst_id, fidx,
++										    stream->rx_asm_next_frag);
++							stream->rx_asm_bad = true;
++							atomic_inc(&stream->rx_frag_drops);
+ 						}
++						stream->rx_asm_next_frag = fidx + 1;
+ 
+ 						/* Append payload to assembly buffer */
+ 						if (stream->rx_asm_len + payload_len >
+@@ -289,6 +314,9 @@ void odl_tb5_rx_callback(struct tb_ring *ring,
  								    payload_len));
  							void *nb = kmalloc(new_cap,
  									   GFP_ATOMIC);
@@ -250,7 +344,7 @@ index aaae32d..84c03d1 100644
  							if (nb) {
  								if (stream->rx_asm_buf)
  									memcpy(nb,
-@@ -306,6 +309,12 @@ void odl_tb5_rx_callback(struct tb_ring *ring,
+@@ -306,6 +334,12 @@ void odl_tb5_rx_callback(struct tb_ring *ring,
  							       stream->rx_asm_len,
  							       payload, payload_len);
  							stream->rx_asm_len += payload_len;
@@ -263,12 +357,41 @@ index aaae32d..84c03d1 100644
  						}
  
  						/* End of message — enqueue complete msg */
-@@ -1344,14 +1353,17 @@ struct odl_tb5_stream *odl_tb5_stream_create(struct odl_tb5_device *dev,
+@@ -313,6 +347,17 @@ void odl_tb5_rx_callback(struct tb_ring *ring,
+ 							struct odl_tb5_rx_msg *rxm;
+ 							unsigned long rxflags;
+ 
++							if (stream->rx_asm_bad) {
++								/* Incomplete: never deliver it. */
++								kfree(stream->rx_asm_buf);
++								stream->rx_asm_buf = NULL;
++								stream->rx_asm_len = 0;
++								stream->rx_asm_cap = 0;
++								stream->rx_asm_bad = false;
++								stream->rx_asm_next_frag = 0;
++								goto rx_frame_done;
++							}
++
+ 							rxm = kzalloc(sizeof(*rxm),
+ 								      GFP_ATOMIC);
+ 							if (rxm && stream->rx_asm_buf) {
+@@ -361,6 +406,7 @@ void odl_tb5_rx_callback(struct tb_ring *ring,
+ 							}
+ 						}
+ 
++rx_frame_done:
+ 						kref_put(&stream->refcount,
+ 							 odl_tb5_stream_free);
+ 					}
+@@ -1344,14 +1390,20 @@ struct odl_tb5_stream *odl_tb5_stream_create(struct odl_tb5_device *dev,
  	INIT_LIST_HEAD(&stream->rx_queue);
  	spin_lock_init(&stream->rx_lock);
  	stream->rx_queue_len = 0;
 -	stream->rx_queue_max = 256;
-+	stream->rx_queue_max = 65536;   /* was 256: a single ~1MB msg = ~264 frames;
++	stream->rx_queue_max = 65536;
++	stream->rx_asm_next_frag = 0;
++	stream->rx_asm_bad = false;
++	atomic_set(&stream->rx_frag_drops, 0);   /* was 256: a single ~1MB msg = ~264 frames;
 +					 * under load the sender runs >256 frames ahead
 +					 * and the old cap silently DROPPED frames ->
 +					 * plugin framing desync -> vLLM hang. */
@@ -283,7 +406,7 @@ index aaae32d..84c03d1 100644
  	mutex_unlock(&dev->stream_lock);
  
  	if (owner) {
-@@ -1427,9 +1439,12 @@ struct odl_tb5_stream *odl_tb5_stream_lookup(struct odl_tb5_device *dev,
+@@ -1427,9 +1479,12 @@ struct odl_tb5_stream *odl_tb5_stream_lookup(struct odl_tb5_device *dev,
  	struct odl_tb5_stream *stream;
  
  	rcu_read_lock();
@@ -298,7 +421,32 @@ index aaae32d..84c03d1 100644
  			rcu_read_unlock();
  			return stream;
  		}
-@@ -1650,6 +1665,9 @@ static int odl_tb5_stream_send_throughput(struct odl_tb5_stream *stream,
+@@ -1509,6 +1564,7 @@ static int odl_tb5_stream_send_latency(struct odl_tb5_stream *stream,
+ 					const void __user *data,
+ 					size_t len)
+ {
++	u16 frag_idx = 0;
+ 	struct odl_tb5_device *dev = stream->dev;
+ 	struct odl_tb5_frame_pool *pool = &dev->frame_pool;
+ 	struct odl_tb5_tx_msg *msg;
+@@ -1554,6 +1610,8 @@ static int odl_tb5_stream_send_latency(struct odl_tb5_stream *stream,
+ 		hdr = slot->virt;
+ 		hdr->src_id = stream->id;
+ 		hdr->dst_id = dst_id;
++		hdr->reserved = 0;
++		hdr->frag_idx = cpu_to_le16(frag_idx++);
+ 		if (first && last)
+ 			hdr->flags = ODL_TB5_SHDR_F_SINGLE;
+ 		else if (first)
+@@ -1618,6 +1676,7 @@ static int odl_tb5_stream_send_throughput(struct odl_tb5_stream *stream,
+ 					   const void __user *data,
+ 					   size_t len)
+ {
++	u16 frag_idx = 0;
+ 	struct odl_tb5_device *dev = stream->dev;
+ 	struct odl_tb5_batch_pool *bpool = &dev->batch_pool;
+ 	struct odl_tb5_tx_msg *msg;
+@@ -1650,6 +1709,9 @@ static int odl_tb5_stream_send_throughput(struct odl_tb5_stream *stream,
  			bpool->free_count > 0,
  			msecs_to_jiffies(5000));
  		if (ret <= 0) {
@@ -308,7 +456,16 @@ index aaae32d..84c03d1 100644
  			if (ret == 0)
  				ret = -ETIMEDOUT;
  			goto wait_pending;
-@@ -1762,14 +1780,44 @@ wait_pending:
+@@ -1682,6 +1744,8 @@ static int odl_tb5_stream_send_throughput(struct odl_tb5_stream *stream,
+ 			/* Stream header */
+ 			hdr->src_id = stream->id;
+ 			hdr->dst_id = dst_id;
++			hdr->reserved = 0;
++			hdr->frag_idx = cpu_to_le16(frag_idx++);
+ 			if (first && last)
+ 				hdr->flags = ODL_TB5_SHDR_F_SINGLE;
+ 			else if (first)
+@@ -1762,14 +1826,44 @@ wait_pending:
   * Non-blocking availability checks (for poll/epoll + async ioctl).
   * Returns true if a send/recv would not block.
   */
@@ -355,7 +512,7 @@ index aaae32d..84c03d1 100644
  }
  
  bool odl_tb5_stream_can_recv(struct odl_tb5_stream *stream)
-@@ -1790,6 +1838,7 @@ int odl_tb5_stream_send(struct odl_tb5_stream *stream,
+@@ -1790,6 +1884,7 @@ int odl_tb5_stream_send(struct odl_tb5_stream *stream,
  	struct odl_tb5_device *dev = stream->dev;
  	enum odl_tb5_tx_mode mode;
  
@@ -363,7 +520,7 @@ index aaae32d..84c03d1 100644
  	if (dev->state != ODL_TB5_STATE_READY)
  		return -ENOTCONN;
  
-@@ -1920,6 +1969,7 @@ int odl_tb5_stream_recv(struct odl_tb5_stream *stream,
+@@ -1920,6 +2015,7 @@ int odl_tb5_stream_recv(struct odl_tb5_stream *stream,
  	int ret = 0;
  
  	/* Wait for a complete assembled message */
@@ -371,7 +528,7 @@ index aaae32d..84c03d1 100644
  	ret = wait_event_interruptible(stream->rx_waitq,
  		atomic_read(&stream->rx_complete) > 0);
  	if (ret)
-@@ -1954,6 +2004,8 @@ int odl_tb5_stream_wait_rx(struct odl_tb5_stream *stream, u32 timeout_ms)
+@@ -1954,6 +2050,8 @@ int odl_tb5_stream_wait_rx(struct odl_tb5_stream *stream, u32 timeout_ms)
  {
  	long ret;
  
@@ -477,14 +634,21 @@ index 350dbb3..aa92c0d 100644
  
  	odl_tb5_chardev_destroy(dev);
 diff --git a/driver/uapi/odl_tb5_uapi.h b/driver/uapi/odl_tb5_uapi.h
-index 77eb50e..b34e893 100644
+index 77eb50e..95f8f80 100644
 --- a/driver/uapi/odl_tb5_uapi.h
 +++ b/driver/uapi/odl_tb5_uapi.h
-@@ -62,7 +62,14 @@ typedef int64_t  __s64;
+@@ -61,8 +61,20 @@ typedef int64_t  __s64;
+ 
  /* ── Stream header (5 bytes, prepended to every DMA frame) ──────────── */
  
- #define ODL_TB5_STREAM_HDR_SIZE      5
+-#define ODL_TB5_STREAM_HDR_SIZE      5
 -#define ODL_TB5_STREAM_PAYLOAD_MAX   (ODL_TB5_FRAME_SIZE - ODL_TB5_STREAM_HDR_SIZE)
++/* 8 bytes: src_id, dst_id, flags, reserved, payload_len, frag_idx.
++ * frag_idx makes fragment loss DETECTABLE - reassembly used to be blind
++ * concatenation gated only by MSG_START/MSG_END, so a single dropped frame
++ * silently produced a short, corrupt message. The pad keeps the payload
++ * 8-byte aligned, which also makes the reassembly memcpy cheaper. */
++#define ODL_TB5_STREAM_HDR_SIZE      8
 +/* A Thunderbolt ring frame carries framing/CRC overhead beyond the payload
 + * the driver writes, so a frame of exactly ODL_TB5_FRAME_SIZE bytes does not
 + * fit the equally-sized RX buffer and is silently dropped by the NHI. Only
@@ -497,12 +661,20 @@ index 77eb50e..b34e893 100644
  #define ODL_TB5_STREAM_ID_CTRL       0
  #define ODL_TB5_STREAM_ID_MAX        255
 diff --git a/lib/include/odl_tb5/odl_tb5_ioctl.h b/lib/include/odl_tb5/odl_tb5_ioctl.h
-index 9797875..beab7a4 100644
+index 9797875..c2fb3da 100644
 --- a/lib/include/odl_tb5/odl_tb5_ioctl.h
 +++ b/lib/include/odl_tb5/odl_tb5_ioctl.h
-@@ -57,7 +57,14 @@ struct odl_tb5_ring_request {
+@@ -55,9 +55,21 @@ struct odl_tb5_ring_request {
  
- #define ODL_TB5_STREAM_HDR_SIZE      5
+ /* ── Stream ioctl structures ───────────────────────────────────────── */
+ 
+-#define ODL_TB5_STREAM_HDR_SIZE      5
++/* 8 bytes: src_id, dst_id, flags, reserved, payload_len, frag_idx.
++ * frag_idx makes fragment loss DETECTABLE - reassembly used to be blind
++ * concatenation gated only by MSG_START/MSG_END, so a single dropped frame
++ * silently produced a short, corrupt message. The pad keeps the payload
++ * 8-byte aligned, which also makes the reassembly memcpy cheaper. */
++#define ODL_TB5_STREAM_HDR_SIZE      8
  #define ODL_TB5_FRAME_SIZE           4096
 -#define ODL_TB5_STREAM_PAYLOAD_MAX   (ODL_TB5_FRAME_SIZE - ODL_TB5_STREAM_HDR_SIZE)
 +/* A Thunderbolt ring frame carries framing/CRC overhead beyond the payload
@@ -518,10 +690,10 @@ index 9797875..beab7a4 100644
  
 diff --git a/tests/odl_rdma_stress.c b/tests/odl_rdma_stress.c
 new file mode 100644
-index 0000000..7df792b
+index 0000000..8932033
 --- /dev/null
 +++ b/tests/odl_rdma_stress.c
-@@ -0,0 +1,482 @@
+@@ -0,0 +1,525 @@
 +/*
 + * OdinLink — RDMA bulk-transfer stress / conformance test
 + *
@@ -564,6 +736,7 @@ index 0000000..7df792b
 +#include <netinet/tcp.h>
 +#include <sys/socket.h>
 +#include <infiniband/verbs.h>
++#include <pthread.h>
 +
 +#define BOOTSTRAP_PORT 18515
 +#define GID_SIZE       16
@@ -575,6 +748,8 @@ index 0000000..7df792b
 +static int      opt_stall_s  = 15;           /* no-progress timeout */
 +static const char *opt_dev   = NULL;
 +static int      opt_gid_idx  = -1;
++static bool     opt_bidir    = false;  /* both peers send AND receive */
++static bool     opt_mixed    = false;  /* interleave small control msgs */
 +
 +struct conn_info {
 +    uint32_t qpn;
@@ -776,6 +951,116 @@ index 0000000..7df792b
 +    }
 +}
 +
++
++/* ── receive path (own thread in --bidir, inline otherwise) ──────────── */
++
++struct rx_args {
++    struct rdma_ctx *r;
++    uint64_t         nmsg;
++    int              rc;        /* 0 ok, 2 corruption, 3 stall */
++};
++
++static void *rx_loop(void *arg)
++{
++    struct rx_args *ra = arg;
++    struct rdma_ctx *r = ra->r;
++
++    for (uint64_t seq = 0; seq < ra->nmsg; seq++) {
++        struct ibv_wc wc;
++        int p = poll_one(r->rcq, &wc, now_s() + opt_stall_s);
++        if (p == -1) {
++            fprintf(stderr,
++                    "STALL: no recv for %ds after %llu msgs (%.1f MiB)\n",
++                    opt_stall_s, (unsigned long long)seq,
++                    seq * opt_chunk / 1048576.0);
++            ra->rc = 3; return NULL;
++        }
++        if (p == -2) {
++            fprintf(stderr, "FAIL recv wc status at msg %llu\n",
++                    (unsigned long long)seq);
++            ra->rc = 2; return NULL;
++        }
++        if (wc.byte_len != opt_chunk)
++            fprintf(stderr, "SHORT msg %llu: got %u bytes, expected %zu\n",
++                    (unsigned long long)seq, wc.byte_len, opt_chunk);
++
++        int slot = (int)wc.wr_id;
++        long bad = verify_chunk(r->rx_buf + (size_t)slot * opt_chunk,
++                                wc.byte_len < opt_chunk ? wc.byte_len : opt_chunk,
++                                seq);
++        if (bad >= 0) {
++            fprintf(stderr,
++                    "CORRUPTION at msg %llu, first bad word %ld (byte %ld of %u)"
++                    " -- %.1f MiB in\n",
++                    (unsigned long long)seq, bad, bad * 8, wc.byte_len,
++                    seq * opt_chunk / 1048576.0);
++            ra->rc = 2; return NULL;
++        }
++        if (!post_rx(r, slot)) {
++            fprintf(stderr, "FAIL repost at msg %llu\n",
++                    (unsigned long long)seq);
++            ra->rc = 3; return NULL;
++        }
++        if ((seq & 0xfff) == 0xfff)
++            printf("  recv+verified %llu/%llu (%.1f MiB)\n",
++                   (unsigned long long)seq + 1, (unsigned long long)ra->nmsg,
++                   (seq + 1) * opt_chunk / 1048576.0);
++    }
++    ra->rc = 0;
++    return NULL;
++}
++
++static int tx_loop(struct rdma_ctx *r, uint64_t nmsg)
++{
++    int inflight = 0;
++    for (uint64_t seq = 0; seq < nmsg; seq++) {
++        fill_chunk(r->tx_buf, opt_chunk, seq);
++
++        struct ibv_sge sge = {0};
++        sge.addr   = (uintptr_t)r->tx_buf;
++        sge.length = opt_chunk;
++        sge.lkey   = r->tx_mr->lkey;
++
++        struct ibv_send_wr wr = {0}, *bad = NULL;
++        wr.wr_id      = seq;
++        wr.opcode     = IBV_WR_SEND;
++        wr.sg_list    = &sge;
++        wr.num_sge    = 1;
++        wr.send_flags = IBV_SEND_SIGNALED;
++
++        if (ibv_post_send(r->qp, &wr, &bad) != 0) {
++            fprintf(stderr, "FAIL post_send at msg %llu: %s\n",
++                    (unsigned long long)seq, strerror(errno));
++            return 3;
++        }
++        inflight++;
++        while (inflight >= opt_tx_depth) {
++            struct ibv_wc wc;
++            int p = poll_one(r->scq, &wc, now_s() + opt_stall_s);
++            if (p == -1) {
++                fprintf(stderr,
++                        "STALL: no send completion for %ds at msg %llu "
++                        "(%.1f MiB sent)\n", opt_stall_s,
++                        (unsigned long long)seq,
++                        seq * opt_chunk / 1048576.0);
++                return 3;
++            }
++            if (p == -2) return 2;
++            inflight--;
++        }
++        if ((seq & 0xfff) == 0xfff)
++            printf("  sent %llu/%llu (%.1f MiB)\n",
++                   (unsigned long long)seq + 1, (unsigned long long)nmsg,
++                   (seq + 1) * opt_chunk / 1048576.0);
++    }
++    while (inflight > 0) {
++        struct ibv_wc wc;
++        if (poll_one(r->scq, &wc, now_s() + opt_stall_s) < 0) return 3;
++        inflight--;
++    }
++    return 0;
++}
++
 +/* ── bootstrap ───────────────────────────────────────────────────────── */
 +
 +static int bootstrap(bool server, const char *peer_ip, struct conn_info *local,
@@ -832,7 +1117,14 @@ index 0000000..7df792b
 +           "  --total <bytes>   total to push, K/M/G  (default 2G)\n"
 +           "  --dev <name>      device name\n"
 +           "  --gid <idx>       force GID index\n"
-+           "  --stall <sec>     no-progress timeout   (default 15)\n");
++           "  --stall <sec>     no-progress timeout   (default 15)\n"
++           "  --bidir           BOTH peers send and receive concurrently.\n"
++           "                    This is what ggml-rpc actually does, and it is\n"
++           "                    the only mode that exercises TX/RX contention\n"
++           "                    for the shared frame pool.\n"
++           "  --mixed           interleave small control messages with bulk,\n"
++           "                    as the RPC protocol does (exercises the\n"
++           "                    latency/throughput dispatcher and odd sizes)\n");
 +}
 +
 +static uint64_t parse_size(const char *s)
@@ -861,6 +1153,8 @@ index 0000000..7df792b
 +        else if (!strcmp(argv[i], "--dev") && i + 1 < argc) opt_dev = argv[++i];
 +        else if (!strcmp(argv[i], "--gid") && i + 1 < argc) opt_gid_idx = atoi(argv[++i]);
 +        else if (!strcmp(argv[i], "--stall") && i + 1 < argc) opt_stall_s = atoi(argv[++i]);
++        else if (!strcmp(argv[i], "--bidir")) opt_bidir = true;
++        else if (!strcmp(argv[i], "--mixed")) opt_mixed = true;
 +        else { usage(); return 1; }
 +    }
 +    if (!server && !peer_ip) { usage(); return 1; }
@@ -890,106 +1184,27 @@ index 0000000..7df792b
 +    double t0 = now_s();
 +    int rc = 0;
 +
-+    if (!server) {
-+        /* Client: mirror the transport's window discipline exactly. */
-+        int inflight = 0;
-+        for (uint64_t seq = 0; seq < nmsg; seq++) {
-+            fill_chunk(r.tx_buf, opt_chunk, seq);
-+
-+            struct ibv_sge sge = {0};
-+            sge.addr   = (uintptr_t)r.tx_buf;
-+            sge.length = opt_chunk;
-+            sge.lkey   = r.tx_mr->lkey;
-+
-+            struct ibv_send_wr wr = {0}, *bad = NULL;
-+            wr.wr_id      = seq;
-+            wr.opcode     = IBV_WR_SEND;
-+            wr.sg_list    = &sge;
-+            wr.num_sge    = 1;
-+            wr.send_flags = IBV_SEND_SIGNALED;
-+
-+            if (ibv_post_send(r.qp, &wr, &bad) != 0) {
-+                fprintf(stderr, "FAIL post_send at msg %llu: %s\n",
-+                        (unsigned long long)seq, strerror(errno));
-+                rc = 3; goto done;
-+            }
-+            inflight++;
-+
-+            while (inflight >= opt_tx_depth) {
-+                struct ibv_wc wc;
-+                int p = poll_one(r.scq, &wc, now_s() + opt_stall_s);
-+                if (p == -1) {
-+                    fprintf(stderr,
-+                            "STALL: no send completion for %ds at msg %llu "
-+                            "(%.1f MiB sent)\n", opt_stall_s,
-+                            (unsigned long long)seq,
-+                            seq * opt_chunk / 1048576.0);
-+                    rc = 3; goto done;
-+                }
-+                if (p == -2) {
-+                    fprintf(stderr, "FAIL send wc status at msg %llu\n",
-+                            (unsigned long long)seq);
-+                    rc = 2; goto done;
-+                }
-+                inflight--;
-+            }
-+            if ((seq & 0x3ff) == 0x3ff)
-+                printf("  sent %llu/%llu (%.1f MiB)\n",
-+                       (unsigned long long)seq + 1, (unsigned long long)nmsg,
-+                       (seq + 1) * opt_chunk / 1048576.0);
++    if (opt_bidir) {
++        /* Both peers send AND receive concurrently on the same QP -- the
++         * pattern ggml-rpc actually uses, and the only one that makes TX and
++         * RX contend for the shared frame pool. A one-way test passes 21 GiB
++         * on hardware where this fails, so this mode is the meaningful one. */
++        struct rx_args ra = { .r = &r, .nmsg = nmsg, .rc = 0 };
++        pthread_t th;
++        if (pthread_create(&th, NULL, rx_loop, &ra) != 0) {
++            perror("pthread_create"); rc = 1; goto done;
 +        }
-+        while (inflight > 0) {
-+            struct ibv_wc wc;
-+            if (poll_one(r.scq, &wc, now_s() + opt_stall_s) < 0) {
-+                fprintf(stderr, "STALL draining send queue\n"); rc = 3; goto done;
-+            }
-+            inflight--;
-+        }
++        rc = tx_loop(&r, nmsg);
++        pthread_join(th, NULL);
++        if (!rc) rc = ra.rc;
++    } else if (!server) {
++        rc = tx_loop(&r, nmsg);
 +    } else {
-+        /* Server: receive, verify every byte, repost. */
-+        for (uint64_t seq = 0; seq < nmsg; seq++) {
-+            struct ibv_wc wc;
-+            int p = poll_one(r.rcq, &wc, now_s() + opt_stall_s);
-+            if (p == -1) {
-+                fprintf(stderr,
-+                        "STALL: no recv for %ds after %llu msgs (%.1f MiB)\n",
-+                        opt_stall_s, (unsigned long long)seq,
-+                        seq * opt_chunk / 1048576.0);
-+                rc = 3; goto done;
-+            }
-+            if (p == -2) {
-+                fprintf(stderr, "FAIL recv wc status at msg %llu\n",
-+                        (unsigned long long)seq);
-+                rc = 2; goto done;
-+            }
-+            if (wc.byte_len != opt_chunk)
-+                fprintf(stderr,
-+                        "SHORT msg %llu: got %u bytes, expected %zu\n",
-+                        (unsigned long long)seq, wc.byte_len, opt_chunk);
-+
-+            int slot = (int)wc.wr_id;
-+            long bad = verify_chunk(r.rx_buf + (size_t)slot * opt_chunk,
-+                                    wc.byte_len < opt_chunk ? wc.byte_len : opt_chunk,
-+                                    seq);
-+            if (bad >= 0) {
-+                fprintf(stderr,
-+                        "CORRUPTION at msg %llu, first bad word %ld "
-+                        "(byte %ld of %u) -- %.1f MiB in\n",
-+                        (unsigned long long)seq, bad, bad * 8, wc.byte_len,
-+                        seq * opt_chunk / 1048576.0);
-+                rc = 2; goto done;
-+            }
-+            if (!post_rx(&r, slot)) {
-+                fprintf(stderr, "FAIL repost at msg %llu\n",
-+                        (unsigned long long)seq);
-+                rc = 3; goto done;
-+            }
-+            if ((seq & 0x3ff) == 0x3ff)
-+                printf("  recv+verified %llu/%llu (%.1f MiB)\n",
-+                       (unsigned long long)seq + 1, (unsigned long long)nmsg,
-+                       (seq + 1) * opt_chunk / 1048576.0);
-+        }
++        struct rx_args ra = { .r = &r, .nmsg = nmsg, .rc = 0 };
++        rx_loop(&ra);
++        rc = ra.rc;
 +    }
++    if (rc) goto done;
 +
 +    {
 +        double dt = now_s() - t0;
@@ -1017,7 +1232,7 @@ index 0610c0e..2f1669f 100644
  )
  
 diff --git a/verbs/src/odl_tb5_verbs.h b/verbs/src/odl_tb5_verbs.h
-index ca73a50..8a24f5c 100644
+index ca73a50..8a90aed 100644
 --- a/verbs/src/odl_tb5_verbs.h
 +++ b/verbs/src/odl_tb5_verbs.h
 @@ -64,6 +64,7 @@
@@ -1041,10 +1256,24 @@ index ca73a50..8a24f5c 100644
  };
  
  /* ── Queue Pair ─────────────────────────────────────────────────────── */
-@@ -136,10 +143,27 @@ struct odl_verbs_qp {
+@@ -135,18 +142,70 @@ struct odl_verbs_qp {
+     struct odl_verbs_pd      *pd;
      struct odl_verbs_cq      *send_cq;
      struct odl_verbs_cq      *recv_cq;
-     uint8_t                   stream_id;
+-    uint8_t                   stream_id;
++    /*
++     * TWO streams per QP, one per direction. A stream is a unidirectional
++     * pipe: the RCCL plugin (the only consumer known to work) opens a
++     * separate stream for send and for recv and never shares one. Using a
++     * single stream for both directions deadlocks bidirectional traffic
++     * immediately -- reproduced with odl_rdma_stress --bidir, both peers
++     * stall on message 1.
++     *
++     * rx_stream_id is what we advertise as qp_num, so the peer's
++     * IBV_QP_DEST_QPN names the stream it should deliver to.
++     */
++    uint8_t                   stream_id;      /* == rx_stream_id, receive on */
++    uint8_t                   tx_stream_id;   /* send from */
 +    /* BUG15: remote stream to address sends at, taken from
 +     * ibv_modify_qp(IBV_QP_DEST_QPN) at the RTR transition. Without this the
 +     * worker sent everything to dst_id 0 and nothing reached the peer. */
@@ -1070,10 +1299,17 @@ index ca73a50..8a24f5c 100644
      int                       sq_head;
      int                       sq_tail;
      int                       sq_count;
-@@ -148,6 +172,24 @@ struct odl_verbs_qp {
-     pthread_t                 worker;
-     bool                      worker_running;
  
+-    /* Worker thread */
++    /* Worker threads: TX and RX are independent, like a real HCA. A single
++     * thread serving both directions deadlocks bidirectional traffic - it
++     * blocks in the TX readiness poll and stops draining RX, so neither peer
++     * can drain the other and both stall. */
+     pthread_t                 worker;
++    pthread_t                 rx_worker;
+     bool                      worker_running;
++    bool                      rx_worker_running;
++
 +    /* Receive queue: buffers posted by the app, awaiting inbound data.
 +     * ibv_post_recv() must NOT block or touch the wire -- it only enqueues.
 +     * The worker thread drains the stream into these buffers and posts the
@@ -1091,11 +1327,10 @@ index ca73a50..8a24f5c 100644
 +    int                       rq_head;
 +    int                       rq_tail;
 +    int                       rq_count;
-+
+ 
      /* Async tracking */
      atomic_int                pending_sends;
-     atomic_int                pending_recvs;
-@@ -251,6 +293,7 @@ int odl_modify_qp(struct ibv_qp *, struct ibv_qp_attr *, int);
+@@ -251,6 +310,7 @@ int odl_modify_qp(struct ibv_qp *, struct ibv_qp_attr *, int);
  int odl_query_qp(struct ibv_qp *, struct ibv_qp_attr *, int, struct ibv_qp_init_attr *);
  int odl_post_send(struct ibv_qp *, struct ibv_send_wr *, struct ibv_send_wr **);
  int odl_post_recv(struct ibv_qp *, struct ibv_recv_wr *, struct ibv_recv_wr **);
@@ -1104,7 +1339,7 @@ index ca73a50..8a24f5c 100644
  /* Ops table init */
  void odl_init_context_ops(struct ibv_context *ctx);
 diff --git a/verbs/src/odl_tb5_verbs_cq.c b/verbs/src/odl_tb5_verbs_cq.c
-index e7cab51..9d7a02e 100644
+index e7cab51..9c5446c 100644
 --- a/verbs/src/odl_tb5_verbs_cq.c
 +++ b/verbs/src/odl_tb5_verbs_cq.c
 @@ -1,3 +1,5 @@
@@ -1127,23 +1362,22 @@ index e7cab51..9d7a02e 100644
      if (cq->eventfd_fd < 0) {
          odl_logerr("eventfd failed: %s", strerror(errno));
          pthread_mutex_destroy(&cq->lock);
-@@ -96,6 +105,15 @@ int odl_poll_cq(struct ibv_cq *cq, int num_entries, struct ibv_wc *wc)
+@@ -96,6 +105,14 @@ int odl_poll_cq(struct ibv_cq *cq, int num_entries, struct ibv_wc *wc)
      struct odl_verbs_cq *ocq = odl_cq_from_ibv(cq);
      int polled = 0;
  
 +    /*
-+     * Drive receive progress from the polling thread BEFORE taking the CQ
-+     * lock (odl_rq_drain -> odl_cq_post takes it). Relying on the QP worker
-+     * alone deadlocks under sustained load: the worker blocks in its TX
-+     * readiness poll, RX is never drained, and both peers spin forever.
++     * Deliberately does NOT drain the receive queue. Draining from here
++     * deadlocks: two threads polling different CQs both enter odl_rq_drain,
++     * which posts completions into the *other* CQ, so they acquire the two
++     * locks in opposite orders (ABBA). Reproduced with odl_rdma_stress
++     * --bidir. Receive progress is owned by the QP's dedicated RX thread, so
++     * it is independent of who is polling what.
 +     */
-+    if (ocq->rx_qp)
-+        odl_rq_drain(ocq->rx_qp);
-+
      pthread_mutex_lock(&ocq->lock);
  
      while (polled < num_entries && ocq->head != ocq->tail) {
-@@ -104,13 +122,33 @@ int odl_poll_cq(struct ibv_cq *cq, int num_entries, struct ibv_wc *wc)
+@@ -104,13 +121,33 @@ int odl_poll_cq(struct ibv_cq *cq, int num_entries, struct ibv_wc *wc)
          polled++;
      }
  
@@ -1447,7 +1681,7 @@ index 0000000..19826b9
 +    return EOPNOTSUPP;
 +}
 diff --git a/verbs/src/odl_tb5_verbs_qp.c b/verbs/src/odl_tb5_verbs_qp.c
-index d45260e..e29bbcf 100644
+index d45260e..db03e36 100644
 --- a/verbs/src/odl_tb5_verbs_qp.c
 +++ b/verbs/src/odl_tb5_verbs_qp.c
 @@ -45,6 +45,7 @@ static int odl_worker_poll_fd(struct odl_verbs_qp *qp, int timeout_ms)
@@ -1458,22 +1692,41 @@ index d45260e..e29bbcf 100644
  static int odl_lookup_dmabuf(struct odl_verbs_context *ctx, uint32_t lkey)
  {
      if (!lkey) return -1;
-@@ -68,21 +69,35 @@ static void *odl_qp_worker(void *arg)
+@@ -61,6 +62,22 @@ static int odl_lookup_dmabuf(struct odl_verbs_context *ctx, uint32_t lkey)
+     return -1;
+ }
+ 
++static void *odl_qp_rx_worker(void *arg)
++{
++    struct odl_verbs_qp *qp = arg;
++
++    /* Receive progress, independent of TX. Short sleep when idle so an empty
++     * link does not burn a core; the driver's own busy-poll (odl_busy_poll_us)
++     * covers the low-latency case. */
++    while (qp->rx_worker_running) {
++        if (odl_rq_drain(qp) == 0) {
++            struct timespec ts = { .tv_sec = 0, .tv_nsec = 20000 }; /* 20 us */
++            nanosleep(&ts, NULL);
++        }
++    }
++    return NULL;
++}
++
+ static void *odl_qp_worker(void *arg)
+ {
+     struct odl_verbs_qp *qp = arg;
+@@ -68,21 +85,31 @@ static void *odl_qp_worker(void *arg)
      odl_tb5_t h = ctx->handle;
  
      while (qp->worker_running) {
 -        struct ibv_send_wr *wr = NULL;
-+        /* Make receive progress on EVERY iteration, not only when idle:
-+         * a QP with continuous send traffic would otherwise never drain RX. */
-+        odl_rq_drain(qp);
- 
--        /* Dequeue one work request */
 +        bool     have_wr = false;
 +        void    *w_bounce = NULL;
 +        uint64_t w_wr_id = 0, w_addr = 0;
 +        uint32_t w_len = 0, w_lkey = 0;
 +        int      w_num_sge = 0;
-+
+ 
+-        /* Dequeue one work request */
 +        /* Dequeue one work request (copies, not caller pointers) */
          pthread_mutex_lock(&qp->sq_lock);
          if (qp->sq_count > 0) {
@@ -1501,7 +1754,7 @@ index d45260e..e29bbcf 100644
              continue;
          }
  
-@@ -111,19 +126,18 @@ static void *odl_qp_worker(void *arg)
+@@ -111,19 +138,18 @@ static void *odl_qp_worker(void *arg)
          struct ibv_wc wc;
          memset(&wc, 0, sizeof(wc));
  
@@ -1515,7 +1768,7 @@ index d45260e..e29bbcf 100644
                  ret = odl_tb5_stream_send_dmabuf(
 -                    h, qp->stream_id, 0,
 -                    dmabuf_fd, 0, sge->length);
-+                    h, qp->stream_id, qp->dest_qp,
++                    h, qp->tx_stream_id, qp->dest_qp,
 +                    dmabuf_fd, 0, w_len);
              } else {
 -                void *data = (void *)(uintptr_t)sge->addr;
@@ -1523,12 +1776,12 @@ index d45260e..e29bbcf 100644
                  ret = odl_tb5_stream_send(
 -                    h, qp->stream_id, 0,
 -                    data, sge->length);
-+                    h, qp->stream_id, qp->dest_qp,
++                    h, qp->tx_stream_id, qp->dest_qp,
 +                    data, w_len);
              }
  
              if (ret == -EAGAIN) {
-@@ -131,7 +145,12 @@ static void *odl_qp_worker(void *arg)
+@@ -131,7 +157,12 @@ static void *odl_qp_worker(void *arg)
                  odl_logverbose("send EAGAIN stream=%u, re-queueing", qp->stream_id);
                  pthread_mutex_lock(&qp->sq_lock);
                  if (qp->sq_count < ODL_VERBS_SQ_DEPTH) {
@@ -1542,7 +1795,7 @@ index d45260e..e29bbcf 100644
                      qp->sq_tail = (qp->sq_tail + 1) % ODL_VERBS_SQ_DEPTH;
                      qp->sq_count++;
                  }
-@@ -139,8 +158,9 @@ static void *odl_qp_worker(void *arg)
+@@ -139,8 +170,9 @@ static void *odl_qp_worker(void *arg)
                  continue;
              }
  
@@ -1553,7 +1806,7 @@ index d45260e..e29bbcf 100644
              wc.opcode   = IBV_WC_SEND;
              wc.qp_num   = qp->base.qp_num;
  
-@@ -148,12 +168,15 @@ static void *odl_qp_worker(void *arg)
+@@ -148,12 +180,15 @@ static void *odl_qp_worker(void *arg)
                  odl_logerr("send failed stream=%u ret=%d", qp->stream_id, ret);
          } else {
              /* Zero-length send */
@@ -1569,13 +1822,51 @@ index d45260e..e29bbcf 100644
          /* Post completion to send CQ */
          if (qp->send_cq)
              odl_cq_post(qp->send_cq, &wc);
-@@ -204,10 +227,15 @@ struct ibv_qp *odl_create_qp(struct ibv_pd *pd,
+@@ -184,7 +219,7 @@ struct ibv_qp *odl_create_qp(struct ibv_pd *pd,
+     if (!qp) { errno = ENOMEM; return NULL; }
+ 
+     /* Open an OdinLink-Five stream */
+-    uint8_t stream_id = 0;
++    uint8_t stream_id = 0, tx_stream_id = 0;
+     int ret = odl_tb5_stream_open(ctx->handle, 0, &stream_id);
+     if (ret != 0) {
+         odl_logerr("stream_open failed: %d", ret);
+@@ -197,6 +232,17 @@ struct ibv_qp *odl_create_qp(struct ibv_pd *pd,
+     qp->base.pd          = pd;
+     qp->base.send_cq     = attr->send_cq;
+     qp->base.recv_cq     = attr->recv_cq;
++    ret = odl_tb5_stream_open(ctx->handle, 0, &tx_stream_id);
++    if (ret < 0) {
++        odl_logerr("tx stream_open failed: %d", ret);
++        odl_tb5_stream_close(ctx->handle, stream_id);
++        free(qp);
++        errno = ENOMEM;
++        return NULL;
++    }
++
++    /* Advertise the RX stream: the peer's dest_qp_num must name where WE
++     * receive, not where we send from. */
+     qp->base.qp_num      = stream_id;
+     qp->base.qp_type     = attr->qp_type;
+     qp->base.state       = IBV_QPS_RESET;
+@@ -204,10 +250,25 @@ struct ibv_qp *odl_create_qp(struct ibv_pd *pd,
      qp->pd               = odl_pd_from_ibv(pd);
      qp->send_cq          = attr->send_cq ? odl_cq_from_ibv(attr->send_cq) : NULL;
      qp->recv_cq          = attr->recv_cq ? odl_cq_from_ibv(attr->recv_cq) : NULL;
+-    qp->stream_id        = stream_id;
++    /*
++     * Polling EITHER CQ must drive receive progress. Wiring only the recv CQ
++     * deadlocks bidirectional traffic: both peers sit in ibv_poll_cq() on
++     * their SEND CQ waiting for completions, so neither drains RX, the rings
++     * fill, and TX never becomes ready again. Reproduced with
++     * odl_rdma_stress --bidir: both sides stall on message 1.
++     */
 +    if (qp->recv_cq)
-+        qp->recv_cq->rx_qp = qp;   /* let poll_cq drive RX progress */
-     qp->stream_id        = stream_id;
++        qp->recv_cq->rx_qp = qp;
++    if (qp->send_cq)
++        qp->send_cq->rx_qp = qp;
++    qp->stream_id        = stream_id;      /* receive on */
++    qp->tx_stream_id     = tx_stream_id;   /* send from */
  
      /* Initialize SQ */
      pthread_mutex_init(&qp->sq_lock, NULL);
@@ -1585,7 +1876,80 @@ index d45260e..e29bbcf 100644
      qp->sq_head  = 0;
      qp->sq_tail  = 0;
      qp->sq_count = 0;
-@@ -289,6 +317,13 @@ int odl_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
+@@ -228,12 +289,28 @@ struct ibv_qp *odl_create_qp(struct ibv_pd *pd,
+     ctx->qps[ctx->nqps++] = qp;
+     pthread_mutex_unlock(&ctx->qp_lock);
+ 
+-    /* Start async worker thread */
++    /* Start async worker threads: TX and RX independently. */
+     qp->worker_running = true;
+     ret = pthread_create(&qp->worker, NULL, odl_qp_worker, qp);
+     if (ret != 0) {
+         odl_logerr("pthread_create failed: %d", ret);
+         qp->worker_running = false;
++        odl_tb5_stream_close(ctx->handle, tx_stream_id);
++        odl_tb5_stream_close(ctx->handle, stream_id);
++        pthread_mutex_destroy(&qp->sq_lock);
++        free(qp);
++        errno = EAGAIN;
++        return NULL;
++    }
++
++    qp->rx_worker_running = true;
++    ret = pthread_create(&qp->rx_worker, NULL, odl_qp_rx_worker, qp);
++    if (ret != 0) {
++        odl_logerr("rx pthread_create failed: %d", ret);
++        qp->rx_worker_running = false;
++        qp->worker_running = false;
++        pthread_join(qp->worker, NULL);
++        odl_tb5_stream_close(ctx->handle, tx_stream_id);
+         odl_tb5_stream_close(ctx->handle, stream_id);
+         pthread_mutex_destroy(&qp->sq_lock);
+         free(qp);
+@@ -241,7 +318,8 @@ struct ibv_qp *odl_create_qp(struct ibv_pd *pd,
+         return NULL;
+     }
+ 
+-    odl_loginfo("create_qp: stream=%u qp_num=%u", stream_id, qp->base.qp_num);
++    odl_loginfo("create_qp: rx_stream=%u tx_stream=%u qp_num=%u",
++                stream_id, tx_stream_id, qp->base.qp_num);
+     ODL_TRACE_EXIT();
+     return &qp->base;
+ }
+@@ -256,14 +334,30 @@ int odl_destroy_qp(struct ibv_qp *qp)
+     struct odl_verbs_qp *oqp = odl_qp_from_ibv(qp);
+     struct odl_verbs_context *ctx = oqp->ctx;
+ 
+-    /* Stop worker thread */
++    /* Stop BOTH worker threads before touching anything they reference.
++     * The RX thread must be joined too, or it keeps draining into a freed
++     * QP after destroy. */
+     oqp->worker_running = false;
++    oqp->rx_worker_running = false;
+     pthread_join(oqp->worker, NULL);
++    pthread_join(oqp->rx_worker, NULL);
+ 
+-    /* Close the OdinLink-Five stream */
++    /* Close both streams (one per direction) */
++    if (oqp->tx_stream_id > 0)
++        odl_tb5_stream_close(oqp->ctx->handle, oqp->tx_stream_id);
+     if (oqp->stream_id > 0)
+         odl_tb5_stream_close(ctx->handle, oqp->stream_id);
+ 
++    /* Release bounce buffers for work requests never transmitted. */
++    pthread_mutex_lock(&oqp->sq_lock);
++    while (oqp->sq_count > 0) {
++        free(oqp->sq_bounce[oqp->sq_head]);
++        oqp->sq_bounce[oqp->sq_head] = NULL;
++        oqp->sq_head = (oqp->sq_head + 1) % ODL_VERBS_SQ_DEPTH;
++        oqp->sq_count--;
++    }
++    pthread_mutex_unlock(&oqp->sq_lock);
++
+     /* Remove from context */
+     pthread_mutex_lock(&ctx->qp_lock);
+     for (int i = 0; i < ctx->nqps; i++) {
+@@ -289,6 +383,13 @@ int odl_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
      ODL_TRACE_ENTRY();
      ODL_RETURN_EINVAL_IF(!qp, "null qp");
  
@@ -1599,7 +1963,7 @@ index d45260e..e29bbcf 100644
      if (attr_mask & IBV_QP_STATE) {
          qp->state = attr->qp_state;
          odl_loginfo("modify_qp: qp_num=%u state=%d -> %d",
-@@ -322,7 +357,38 @@ int odl_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
+@@ -322,7 +423,38 @@ int odl_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
              return -ENOMEM;
          }
  
@@ -1639,7 +2003,7 @@ index d45260e..e29bbcf 100644
          oqp->sq_tail = (oqp->sq_tail + 1) % ODL_VERBS_SQ_DEPTH;
          oqp->sq_count++;
          atomic_fetch_add(&oqp->pending_sends, 1);
-@@ -340,72 +406,104 @@ int odl_post_recv(struct ibv_qp *qp, struct ibv_recv_wr *wr,
+@@ -340,72 +472,104 @@ int odl_post_recv(struct ibv_qp *qp, struct ibv_recv_wr *wr,
                     struct ibv_recv_wr **bad_wr)
  {
      struct odl_verbs_qp *oqp = odl_qp_from_ibv(qp);
@@ -1798,7 +2162,7 @@ index d45260e..e29bbcf 100644
  }
  
  /* ── Query QP ───────────────────────────────────────────────────────── */
-@@ -451,3 +549,8 @@ int odl_query_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
+@@ -451,3 +615,8 @@ int odl_query_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
  
      ODL_TRACE_EXIT_VAL(0);
  }
