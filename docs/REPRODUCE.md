@@ -1,8 +1,13 @@
 # Reproducible RCCL cross-node tensor-parallel for llama.cpp (Strix Halo)
 
-Adds an **in-graph RCCL all-reduce** so `-sm tensor` (tensor parallelism) runs across TWO
-nodes with the collective rendezvousing inside RCCL, instead of the host-side "butterfly"
-of GET/SET_TENSOR RPC round-trips.
+Adds an **in-graph RCCL all-reduce** so `-sm tensor` (tensor parallelism) runs across
+separate nodes with the collective rendezvousing inside RCCL, instead of the host-side
+"butterfly" of GET/SET_TENSOR RPC round-trips.
+
+The communicator is N-rank — `GGML_NCCL_WORLD` sets the size and rank 0 serves the unique
+ID to all `N-1` peers. Everything below is written for and measured on two nodes, which is
+the hardware available here; larger worlds should follow from the same steps but have not
+been run.
 
 **Measured (Qwen3.5-2B, `-sm tensor`, 2× Strix Halo over the Thunderbolt bond, TCP):**
 | path | t/s |

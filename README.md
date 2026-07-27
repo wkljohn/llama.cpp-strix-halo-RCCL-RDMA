@@ -1,7 +1,12 @@
 # llama.cpp-strix-halo-RCCL-RDMA
 
-**Cross-node inference on 2× AMD Strix Halo — over RDMA on the Thunderbolt cable you
+**Cross-node inference on AMD Strix Halo — over RDMA on the Thunderbolt cable you
 already have, plus an in-graph RCCL all-reduce for tensor parallelism.**
+
+The world communicator is **N-rank**, not two: `GGML_NCCL_WORLD` sets the size, rank 0
+serves the `ncclUniqueId` to every peer, and the only constraint the code enforces is
+`world >= 2`. Everything measured here is 2 nodes, because that is the hardware on hand
+— **3+ is supported by construction, untested in practice.**
 
 Two parts, usable independently:
 
@@ -66,12 +71,21 @@ cmake -S . -B build -DGGML_HIP=ON -DGGML_HIP_RCCL=ON -DAMDGPU_TARGETS=gfx1151 \
       -DGGML_RPC=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target llama-bench ggml-rpc-server -j$(nproc)
 
-# env (both nodes): NCCL_SOCKET_IFNAME=bond0 NCCL_IB_DISABLE=1 NCCL_CUMEM_ENABLE=0
-#   GGML_NCCL_WORLD=2 GGML_NCCL_MASTER=<head-ip>:29500
-# peer: GGML_NCCL_RANK=1 ggml-rpc-server -H 0.0.0.0 -p 50070
-# head: GGML_NCCL_RANK=0 GGML_META_WORLD_ALLREDUCE=1 llama-bench -m <model> \
-#         --rpc <peer-ip>:50070 -sm tensor -ts 50/50 -ngl 99
+# env (every node): NCCL_SOCKET_IFNAME=bond0 NCCL_IB_DISABLE=1 NCCL_CUMEM_ENABLE=0
+#   GGML_NCCL_WORLD=<N> GGML_NCCL_MASTER=<head-ip>:29500
+# peers: GGML_NCCL_RANK=<1..N-1> ggml-rpc-server -H 0.0.0.0 -p 50070
+# head:  GGML_NCCL_RANK=0 GGML_META_WORLD_ALLREDUCE=1 llama-bench -m <model> \
+#          --rpc <peer1>:50070,<peer2>:50070 -sm tensor -ts 34/33/33 -ngl 99
 ```
+
+**Scaling past two nodes.** Set `GGML_NCCL_WORLD` to the node count, give each peer a
+distinct `GGML_NCCL_RANK`, pass every peer to `--rpc`, and size `-ts` to match. Rank 0
+blocks until all `N-1` peers have collected the unique ID. Nothing in the port assumes
+two — but nothing beyond two has been run here, so treat 3+ as untested.
+
+The **RDMA transport does not follow automatically**: a Thunderbolt cable is
+point-to-point, so 3+ nodes need a topology (daisy chain, or more ports per node) that
+was never built or measured. Over TCP/IP the node count is unconstrained.
 
 To point RCCL at the RDMA link instead of TCP, see
 **[odinlink/REPRODUCE-RCCL.md](odinlink/REPRODUCE-RCCL.md)** — three separate traps there
