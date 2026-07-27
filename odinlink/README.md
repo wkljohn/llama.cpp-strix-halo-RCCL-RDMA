@@ -1,3 +1,22 @@
+> ## ✅ RDMA INFERENCE IS WORKING — see [RDMA-INFERENCE.md](RDMA-INFERENCE.md)
+>
+> Two Strix Halo nodes now run llama.cpp cross-node inference with tensor traffic over
+> **RDMA on the Thunderbolt/USB4 cable**, no NIC:
+>
+> ```
+> RDMA activated: qpn=2304->2304 mtu=4096 rx_depth=24
+> ```
+>
+> | 27B Q6_K, 2 nodes, `-sm layer` | pp512 | tg128 |
+> |---|---|---|
+> | **RDMA** | 290.23 ± 61.80 | **9.07 ± 0.01** |
+> | TCP | 292.11 ± 62.37 | 8.83 ± 0.03 |
+>
+> **Important:** that works via the `thunderbolt-ibverbs` DKMS module, **not** OdinLink.
+> OdinLink has the faster raw transport (22.9 µs vs 286 µs) but registers no kernel RDMA
+> device and resolves a stale rdma-core ABI symbol, so llama.cpp/RCCL cannot discover it.
+> See BUG 11 in [RDMA-INFERENCE.md](RDMA-INFERENCE.md) for exactly what it needs.
+
 # RDMA over Thunderbolt/USB4 on Strix Halo — OdinLink bring-up
 
 > ## ✅ STATUS: the crash was a local regression, not the upstream driver — now fixed
@@ -189,7 +208,8 @@ That silent fallback is the single easiest way to "measure RDMA" and actually be
 
 | | |
 |---|---|
-| [`FINDINGS.md`](FINDINGS.md) | 10 bugs, root cause + patch for each, with dmesg evidence |
+| [`RDMA-INFERENCE.md`](RDMA-INFERENCE.md) | **working RDMA inference recipe + measured data** |
+| [`FINDINGS.md`](FINDINGS.md) | 12 bugs, root cause + patch for each, with dmesg evidence |
 | [`scripts/odl-bringup.sh`](scripts/odl-bringup.sh) | load + single-service bind + wait for READY |
 | [`scripts/odl-reload.sh`](scripts/odl-reload.sh) | no-reboot TB stack reload (clears the hop-ID leak) |
 | [`scripts/odl-measure.sh`](scripts/odl-measure.sh) | latency + bandwidth run |
