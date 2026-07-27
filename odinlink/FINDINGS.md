@@ -692,3 +692,76 @@ IOMMU fault recurs. Until it has:
 - do not cite this section as evidence of an upstream bug;
 - if you reproduce `IO_PAGE_FAULT` on a **clean upstream checkout** with no local patches,
   that would be a genuine finding worth reporting — this one was not.
+
+---
+
+# BUG 10 — DMA verify handshake is an unwinnable race; second node always fails
+
+**Severity: blocker.** This is why two nodes never both reached READY, and it is a real
+upstream bug (not a local regression — unlike BUG 9).
+
+### Symptom
+One node reaches READY instantly. The other spins for ~31 s and dies with:
+```
+OdinLink: DMA ping attempt 300, still waiting for pong
+OdinLink: DMA verify failed after 300 attempts
+```
+The link is *perfectly healthy* — the failing node has already received and answered the
+peer's PING. It just never gets one back.
+
+### Root cause
+`odl_tb5_verify_work_fn()` succeeds on the first node, which then immediately does:
+```c
+pr_info("OdinLink: DMA path verified, resetting rings for userspace\n");
+flush_work(&dev->ctrl_reply_work);
+hrtimer_cancel(&dev->rx_poll_timer);
+odl_tb5_rings_reset(dev);          /* drops every posted RX frame */
+dev->state = ODL_TB5_STATE_READY;
+dev->rx_target = 0;
+atomic_set(&dev->rx_posted, 0);    /* and posts NO new ones */
+```
+The comment above it is explicit that pool RX repost does not restart until userspace issues
+a `STREAM_OPEN` ioctl. So from the moment the first node goes READY it has **zero RX frames
+posted** and silently drops everything the peer sends. The second node's PINGs land nowhere,
+its PONG never comes, and it fails — 100 % of the time, because the winner always resets
+before the loser's verify loop can complete.
+
+Measured asymmetry that identified it: winner received **0** frames after READY while the
+loser sent **300**; before the winner flipped, delivery was 300/300. The direction that
+"died" always followed whichever node reached READY first.
+
+### Fix (applied)
+A node that *answers* a PING has already proven the path in both directions: it received a
+frame (RX works) and successfully submitted one (TX works). It must not wait for a PONG that
+by construction will never arrive.
+
+```c
+	if (type == ODL_TB5_DMA_PING) {
+		int ret;
+
+		pr_info("OdinLink: DMA ping received, sending pong\n");
+		ret = odl_tb5_send_dma_msg(dev, ODL_TB5_DMA_PONG);
+
+		/* Answering a PING proves RX and TX both work. */
+		if (!ret && !dev->pong_received) {
+			dev->pong_received = true;
+			wake_up_all(&dev->verify_waitq);
+		}
+	} else {
+```
+
+### Result
+Both nodes reach READY in **~0.4 ms**, first attempt, no retries:
+```
+node2: DMA ping received, sending pong
+node2: DMA path verified, resetting rings for userspace
+node2: entering READY state
+```
+End-to-end CLI over the verified link: **median 22.92 µs**, p95 34.31 µs, jitter 5.53 µs,
+1000/1000 iterations, "All tests completed successfully".
+
+### Note for upstream
+An alternative fix is to keep a small number of RX frames posted in READY state so ctrl
+frames remain serviceable. That is arguably cleaner but changes buffer accounting that the
+legacy daemon/CLI consumers depend on; the fix above is minimal and touches only the
+handshake.

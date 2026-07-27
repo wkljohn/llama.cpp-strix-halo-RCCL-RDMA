@@ -120,6 +120,10 @@ Use [`scripts/odl-bringup.sh`](scripts/odl-bringup.sh), or by hand:
 sudo insmod driver/odl_tb5.ko e2e=0 max_devices=1 login_max_retries=20
 ```
 
+> **You need the BUG 10 patch for two nodes to work at all.** Without it the second node
+> always dies with `DMA verify failed after 300 attempts`, because the first node to verify
+> resets its rings and posts zero RX frames. See [FINDINGS.md](FINDINGS.md) BUG 10.
+
 Both nodes must reach READY — this is the only success signal that matters:
 
 ```bash
@@ -185,7 +189,7 @@ That silent fallback is the single easiest way to "measure RDMA" and actually be
 
 | | |
 |---|---|
-| [`FINDINGS.md`](FINDINGS.md) | 9 bugs, root cause + patch for each, with dmesg evidence |
+| [`FINDINGS.md`](FINDINGS.md) | 10 bugs, root cause + patch for each, with dmesg evidence |
 | [`scripts/odl-bringup.sh`](scripts/odl-bringup.sh) | load + single-service bind + wait for READY |
 | [`scripts/odl-reload.sh`](scripts/odl-reload.sh) | no-reboot TB stack reload (clears the hop-ID leak) |
 | [`scripts/odl-measure.sh`](scripts/odl-measure.sh) | latency + bandwidth run |
