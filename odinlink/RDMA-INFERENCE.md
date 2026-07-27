@@ -378,12 +378,54 @@ odl_poll_cq -> eventfd_read (blocked)
   <- rdma_poll <- rdma_recv <- send_rpc_cmd <- ggml_backend_rpc_get_device_memory
 ```
 
+## BUG 19 — `ibv_poll_cq` deadlocked against its own completion producer (FIXED here)
+
+```c
+/* Clear eventfd if we drained the ring */
+if (ocq->head == ocq->tail) {
+    eventfd_t val;
+    eventfd_read(ocq->eventfd_fd, &val);
+}
+pthread_mutex_unlock(&ocq->lock);
+```
+
+`ibv_poll_cq()` is defined to be non-blocking — consumers busy-poll it. This implementation
+blocked in `eventfd_read()` on an empty CQ **while still holding `ocq->lock`**, and
+`odl_cq_post()` needs that same lock to deliver a completion. The only thread that could wake
+the poller was locked out of doing so. Captured stack:
+
+```
+odl_poll_cq -> eventfd_read (blocked)
+  <- rdma_poll <- rdma_recv <- send_rpc_cmd <- ggml_backend_rpc_get_device_memory
+```
+
+Fix: drain the eventfd outside the lock, only when completions were actually consumed, and
+force `O_NONBLOCK` at CQ creation rather than trusting the flag. Note the empty-CQ path must
+do **no** syscalls at all — an `fcntl`+`eventfd_read` per poll iteration dominates the
+transfer and is itself a (softer) failure mode.
+
+## Where it stands now
+
+Fixing BUG 11/13/14/15/16/17/18/19 moves OdinLink from *invisible to every RDMA application*
+to **carrying real llama.cpp traffic**. Progression of the stall point, each step verified:
+
+| after fixing | head reached |
+|---|---|
+| — (upstream) | `ibv_devices` empty; nothing could find the device |
+| BUG 11 | device opened, QP created — `RDMA probed` |
+| BUG 13 | `RDMA activated: qpn=20->20 mtu=4096 rx_depth=24` on **both** nodes |
+| BUG 16/17/18 | frames flowing both directions, µs cadence (was 5 s/message) |
+| BUG 19 | past device query + buffer alloc into `buffer_set_tensor` — **uploading weights** |
+
+**It still does not finish a benchmark.** The head now sits in
+`ggml_backend_rpc_buffer_set_tensor` <- `llama_model_loader::load_all_data`, busy-polling
+normally (not deadlocked), during the 1.93 GiB weight upload. This is now a *throughput*
+problem, not a liveness one.
+
 ### Remaining suspects, in order
 
-1. **`odl_poll_cq()` blocks.** It waits in `eventfd_read()` when the CQ is empty. `ibv_poll_cq`
-   is defined to be non-blocking — poll the queue, return 0 if nothing is ready. Consumers
-   busy-poll it in a loop and may hold locks meanwhile, so a blocking implementation can
-   deadlock against the very worker thread that would post the completion. **Fix this first.**
+
+1. ~~**`odl_poll_cq()` blocks.**~~ **Fixed — see BUG 19 above.**
 2. **Large-message segmentation.** Control messages are ≤8 bytes and work; the first 256 KiB
    chunk does not. `odl_tb5_stream_send()` has an "adaptive dispatcher" choosing latency vs
    throughput paths by size — the large path (batch pool / fragmentation) is likely where
