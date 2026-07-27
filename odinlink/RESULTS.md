@@ -33,6 +33,43 @@ are for *capacity*, not speed. RDMA recovers about half the cross-node penalty
 > `ODL_TB5` plugin simply has not been done yet. See
 > [REPRODUCE-RCCL.md](REPRODUCE-RCCL.md).
 
+## RCCL collectives over RDMA — working
+
+`test-world-allreduce`, 2 ranks, 60 all-reduces/graph, 24 KB each, single channel:
+
+| transport | per all-reduce | correctness |
+|---|---|---|
+| **RDMA (OdinLink + this plugin)** | **100 µs** | `reduced to 1.50` ✅ |
+| TCP over bond0 | 286 µs | `reduced to 1.50` ✅ |
+
+**2.9× lower.** Proof the payload really crossed RDMA rather than falling back to sockets:
+`bond0` TX moved only **13 KiB** across the entire run (bootstrap only), while the plugin
+logged **2520 isend / 2520 irecv / 0 failures**. A t/s number alone is never evidence of
+transport — three separate silent-fallback modes are documented in
+[REPRODUCE-RCCL.md](REPRODUCE-RCCL.md).
+
+This is the first cross-node RCCL collective carried by OdinLink. `ncclCommInitRank`
+completes in ~2.9 s over the plugin, 12 channels connect, and the ABI is v7.
+
+> ### Trap that cost hours: a stale test binary
+>
+> This ran "broken" for a long time — `out=1.000000 expect=1.500000` — and the failure was
+> blamed on the plugin through four wrong hypotheses (NULL-request completion, wrong size
+> reporting, `iflush`/APU cache coherency, channel-stream mapping). None were the cause.
+>
+> ```
+> test-world-allreduce   built  Jul 20 23:19
+> tests/test-world-allreduce.cpp modified Jul 21 00:33   <- 74 min NEWER than the binary
+> libggml-hip.so.0       rebuilt Jul 27 15:14            <- 6 days newer, loaded at runtime
+> ```
+>
+> An old test binary dynamically loading freshly-rebuilt ggml. One `cmake --build` fixed it.
+>
+> **What actually found it: running the same test over TCP.** It failed identically, which
+> proved the transport was never implicated. That control should have been the *first* move,
+> before reading a line of plugin source. When a component is suspected, test it against a
+> known-good substitute before analysing its internals.
+
 ## Transport
 
 > ## ⚠️ Bidirectional transport is NOT reliable. Retracted 2026-07-27.
