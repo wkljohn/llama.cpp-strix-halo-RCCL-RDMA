@@ -25,13 +25,10 @@ nodes cost ~3.6 % because `-sm layer` crosses the wire once per token. Two nodes
 are for *capacity*, not speed. RDMA recovers about half the cross-node penalty
 (8.83 → 9.16 against a 9.50 ceiling).
 
-> **Every inference figure on this page is `-sm layer` (pipeline).** Tensor
-> parallel over RDMA — the case a 13× latency win should actually transform,
-> since it all-reduces every layer — **has not been benchmarked**. Not because
-> anything blocks it: RCCL binds the OdinLink plugin, and `-sm tensor` runs fine
-> over TCP (27B at 3.65/4.02 t/s, in the repo root). The run pointing TP at the
-> `ODL_TB5` plugin simply has not been done yet. See
-> [REPRODUCE-RCCL.md](REPRODUCE-RCCL.md).
+> **Every inference figure on this page is `-sm layer` (pipeline).** Tensor-parallel
+> *inference* over RDMA has still not been benchmarked — but the collective it depends on
+> now works and is measured at **100 µs/allreduce** (below), against 286 µs over TCP.
+> Nothing known blocks the inference run; it simply has not been made yet.
 
 ## RCCL collectives over RDMA — working
 
@@ -112,12 +109,40 @@ corruption on later messages. That is why the reported offsets look erratic
 (sometimes byte 0, sometimes mid-message): the first casualty is the message
 that vanished, not the one that fails verification.
 
-**Mechanism not yet established.** Two hypotheses have already been tested and
-killed: chunk-size threshold (it is intermittent at every size above the batch
-threshold) and batch-buffer overflow (that predicts loss at a fixed boundary;
-the measured positions vary). A live candidate is that the RX callback never
-examines NHI error flags — it checks only `frame->size` — so hardware-flagged
-frames would be lost invisibly. Untested.
+### Mechanism: a marginal cable, not a software defect
+
+**Established.** Adding NHI error-flag checking to the receive callback (BUG 28) caught it
+on the first failure, on both nodes at once:
+
+```
+RX CRC error (size=3520 flags=0xb) - frame dropped, total=1
+stream 20 fragment gap: got 39 expected 38 (lost 1); rx crc=1 ovr=0 cancel=2048 ok=980073
+```
+
+**The hardware was reporting CRC errors and the driver was silently accepting the corrupt
+frames.** Error rate ≈ 1 per 10⁶ frames, which predicts 0.125 failures per 512 MiB duplex
+run — exactly the observed 1-in-8.
+
+The "always exactly two fragments" signature was an *artifact of the missing check*: the
+corrupt frame was consumed, advancing the sequence past it while the real frame was also
+absent. With the check in place the gap became 1, not 2.
+
+Hypotheses tested and killed on the way, recorded so nobody repeats them: chunk-size
+threshold, send depth, batch-buffer overflow, and frame-pool starvation (`rx_repost_starved`
+never fired).
+
+### The other cable is clean
+
+The rig has two USB4 cables; `max_devices=1` binds one. Rebinding both nodes to the second:
+
+| | cable A (`0-2.1`) | cable B (`1-2.1`) |
+|---|---|---|
+| 512 MiB duplex runs | 7 pass / 1 fail | **10 pass / 0 fail** |
+| new CRC errors | 1 per ~980k frames | **0** |
+
+Ten runs is a real signal, not proof — at cable A's rate you would expect ~1.25 failures in
+10. ~5 GiB of clean duplex is also far short of a 27B run's 20 GiB. Retransmission is still
+absent (BUG 22), so a single bit error anywhere in a large transfer still means a hang.
 
 ### Why this matters more for collectives than for RPC
 
