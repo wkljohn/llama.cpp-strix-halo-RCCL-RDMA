@@ -287,28 +287,107 @@ post time. The same commit sets `wc.wr_id` on send completions, which was never 
 consumers that match completions by `wr_id` (llama.cpp uses the chunk sequence number) could
 not have worked.
 
-## What is still broken
+## BUG 16 — `cmd_fd` clobbered immediately after being set (FIXED here)
 
-After `RDMA activated` on both nodes the first payload exchange does not complete: the head
-blocks and the run times out, while the driver shows the stream created and torn down
-(`odl_tb5: stream 20 created` / `destroying`). Both peers independently chose stream id 20, so
-that coincidence has not been ruled out as load-bearing. Suspects, in order:
+`odl_ibv_open_device()` set up the device fd and then the "Initialize context fields" block
+four lines later overwrote it:
 
-1. ~~**Stream addressing.**~~ **Tried, did not fix.** `odl_modify_qp()` ignored
-   `IBV_QP_DEST_QPN` entirely, so the worker sent everything to `dst_id = 0`. The patch now
-   captures `attr->dest_qp_num` at the RTR transition and addresses sends with it
-   (`odl_tb5_stream_send(h, stream_id, dest_qp, ...)`). Correct and worth keeping, but the
-   stall persists — so `dst_id` is evidently not simply "the remote stream id", and the real
-   local↔remote pairing semantics of `odl_tb5_stream_open(filter_id)` need to be established
-   from the driver side. **This is the open question.**
-2. ~~**RX drain scheduling.**~~ **Tried, did not fix.** `odl_rq_drain()` now runs on every
-   worker iteration rather than only when idle, so send traffic cannot starve receives.
-   Correct, but not the blocker.
-3. **Flow control / chunking.** llama.cpp sends 256 KiB chunks with `RDMA_TX_DEPTH=2` in
-   flight; OdinLink's frame pool and E2E credits may need explicit backpressure rather than
-   `-EAGAIN` re-queueing. **Not yet investigated.**
-4. **Stream pairing across nodes.** Both peers independently auto-assigned stream id 20. If
-   `odl_tb5_stream_open()` filters are node-local, two peers can hold "stream 20" that are not
-   connected to each other at all, and no amount of userspace addressing will join them —
-   the CLI's own client/server test does its own pairing handshake that this path skips.
-   **Most likely culprit now; start here.**
+```c
+    ctx->base.cmd_fd = dev_fd;     /* fd stored */
+}
+/* Initialize context fields */
+ctx->base.cmd_fd        = -1;      /* ...and immediately thrown away */
+```
+
+`odl_worker_poll_fd()` therefore always returned `-EBADF`, so the worker never waited for TX
+readiness and busy-spun on `send EAGAIN, re-queueing` at ~1 000 log lines/second. Fix: assign
+the fd *after* the defaults.
+
+## BUG 18 — verify clears the proof that a peer PING already provided (FIXED here)
+
+A regression in this repo's own BUG 10 fix. `odl_tb5_ctrl_reply_work_fn()` sets
+`pong_received = true` when it answers a peer PING, but if that PING arrives *before* the local
+`odl_tb5_verify_work_fn()` starts — which is the common case when the peer loaded first —
+verify's first statement wipes it:
+
+```c
+dev->pong_received = false;   /* discards the proof we already had */
+```
+
+Verify then times out, the device stays in `CONNECTED` (state 2) instead of reaching `READY`
+(state 4), and since `odl_tb5_stream_can_send()` requires READY, **every send returns
+`-EAGAIN` forever**. Observed directly:
+
+```
+odl_tb5: can_send=0 state=2 free=1024 reserve=64 rx_target=512 rx_posted=0
+```
+
+Note `free=1024` — the frame pool was completely idle; state was the only failing term.
+
+Fix: a separate `peer_ping_answered` flag that verify does not clear (reset only when a new
+connection begins), honoured by the wait condition and the final check.
+
+## BUG 17 — `poll()` POLLOUT was a chicken-and-egg (FIXED here)
+
+```c
+/* Writable if TX has room */
+if (atomic_read(&dev->tx.completed) > 0)
+    mask |= EPOLLOUT | EPOLLWRNORM;
+```
+
+TX counted as writable only once a previous TX had *completed* — never true before the first
+send. Every non-blocking sender therefore burned the full 5 s poll timeout per message. This
+was measurable in the driver log: TX submissions exactly 5 s apart.
+
+```
+[11909.495468] TX submit stream=20 dst=20 len=1
+[11914.501045] TX submit stream=20 dst=20 len=8     <- +5.0 s
+[11919.506541] TX submit stream=20 dst=20 len=4     <- +5.0 s
+```
+
+Fix: POLLOUT must mean "a send would succeed now" — the same condition
+`odl_tb5_stream_can_send()` applies (READY + free frames above the reserve). After the fix the
+same trace shows microsecond spacing:
+
+```
+[12015.724070] TX submit stream=20 dst=20 len=1
+[12015.724080] TX submit stream=20 dst=20 len=8     <- +10 us
+[12015.724084] TX submit stream=20 dst=20 len=4     <- +4 us
+```
+
+## Where it stands now
+
+With BUG 11/13/14/15/16/17/18 fixed, OdinLink goes from *invisible to every RDMA application*
+to **moving frames in both directions under llama.cpp**, verified at the driver level on both
+nodes:
+
+```
+node1: TX submit stream=20 dst=20 ...   RX frame dst_id=20 src_id=20
+node2: TX submit stream=20 dst=20 ...   RX frame dst_id=20 src_id=20
+```
+
+Both peers reach `RDMA activated: qpn=20->20 mtu=4096 rx_depth=24`, the device reaches state
+READY, and `can_send` no longer fails.
+
+**It still does not finish a benchmark.** The RPC handshake's small control messages (len=1,
+4, 8) flow at microsecond cadence, then the transfer stops at the first bulk payload and the
+run has to be killed. The head's stack at that point:
+
+```
+odl_poll_cq -> eventfd_read (blocked)
+  <- rdma_poll <- rdma_recv <- send_rpc_cmd <- ggml_backend_rpc_get_device_memory
+```
+
+### Remaining suspects, in order
+
+1. **`odl_poll_cq()` blocks.** It waits in `eventfd_read()` when the CQ is empty. `ibv_poll_cq`
+   is defined to be non-blocking — poll the queue, return 0 if nothing is ready. Consumers
+   busy-poll it in a loop and may hold locks meanwhile, so a blocking implementation can
+   deadlock against the very worker thread that would post the completion. **Fix this first.**
+2. **Large-message segmentation.** Control messages are ≤8 bytes and work; the first 256 KiB
+   chunk does not. `odl_tb5_stream_send()` has an "adaptive dispatcher" choosing latency vs
+   throughput paths by size — the large path (batch pool / fragmentation) is likely where
+   delivery or completion generation breaks.
+3. **RX completion for partial reads.** `odl_rq_drain()` posts one WC per `stream_recv`; if the
+   driver delivers a 256 KiB message as multiple frames, byte_len accounting and buffer reuse
+   need to match what the consumer expects.

@@ -1,5 +1,32 @@
+diff --git a/driver/odl_tb5_chardev.c b/driver/odl_tb5_chardev.c
+index 229abc5..af1f3b8 100644
+--- a/driver/odl_tb5_chardev.c
++++ b/driver/odl_tb5_chardev.c
+@@ -507,9 +507,19 @@ static __poll_t odl_tb5_poll(struct file *filp, poll_table *wait)
+ 	if (atomic_read(&dev->rx.completed) > 0)
+ 		mask |= EPOLLIN | EPOLLRDNORM;
+ 
+-	/* Writable if TX has room (completed tx < submitted tx means
+-	 * some TX completions have drained) */
+-	if (atomic_read(&dev->tx.completed) > 0)
++	/*
++	 * BUG17: this used to require atomic_read(&dev->tx.completed) > 0,
++	 * i.e. "writable only once a previous TX has completed" -- a
++	 * chicken-and-egg that is never true before the first send. Every
++	 * non-blocking sender therefore burned the full poll timeout (5 s)
++	 * per message: traffic still flowed, but at ~0.2 messages/second.
++	 *
++	 * POLLOUT must mean "a send would succeed now", which is exactly the
++	 * condition odl_tb5_stream_can_send() applies.
++	 */
++	if (dev->state == ODL_TB5_STATE_READY &&
++	    dev->frame_pool.slots &&
++	    dev->frame_pool.free_count > ODL_TB5_TX_POOL_RESERVE)
+ 		mask |= EPOLLOUT | EPOLLWRNORM;
+ 
+ 	/* Per-stream readability: check if any stream has pending RX */
 diff --git a/driver/odl_tb5_core.h b/driver/odl_tb5_core.h
-index 40670d0..283035d 100644
+index 40670d0..e41653a 100644
 --- a/driver/odl_tb5_core.h
 +++ b/driver/odl_tb5_core.h
 @@ -245,6 +245,11 @@ struct odl_tb5_device {
@@ -14,8 +41,21 @@ index 40670d0..283035d 100644
  
  	/* DMA verification (ping/pong) */
  	struct work_struct	verify_work;
+@@ -252,6 +257,12 @@ struct odl_tb5_device {
+ 	struct hrtimer		rx_poll_timer;
+ 	wait_queue_head_t	verify_waitq;
+ 	bool			pong_received;
++	/* Set when we answer a peer PING. Unlike pong_received this is NOT
++	 * cleared by verify_work, because the peer's ping can arrive BEFORE
++	 * our own verify starts -- clearing it there loses the proof and the
++	 * verify then times out with the link perfectly healthy. Reset only
++	 * when a new connection begins. */
++	bool			peer_ping_answered;
+ 	int			verify_rx_type;
+ 
+ 	/* Connection state */
 diff --git a/driver/odl_tb5_proto.c b/driver/odl_tb5_proto.c
-index 1c1bc38..e524730 100644
+index 1c1bc38..d849e54 100644
 --- a/driver/odl_tb5_proto.c
 +++ b/driver/odl_tb5_proto.c
 @@ -27,6 +27,13 @@
@@ -87,7 +127,7 @@ index 1c1bc38..e524730 100644
  		return ret;
  	}
  
-@@ -464,8 +489,24 @@ static void odl_tb5_ctrl_reply_work_fn(struct work_struct *work)
+@@ -464,8 +489,26 @@ static void odl_tb5_ctrl_reply_work_fn(struct work_struct *work)
  	int type = dev->verify_rx_type;
  
  	if (type == ODL_TB5_DMA_PING) {
@@ -106,14 +146,54 @@ index 1c1bc38..e524730 100644
 +		 * PINGs land nowhere and our own PONG never arrives.  The
 +		 * second node then always fails "DMA verify failed after 300
 +		 * attempts" even though the link is perfectly healthy. */
-+		if (!ret && !dev->pong_received) {
-+			dev->pong_received = true;
++		if (!ret) {
++			dev->peer_ping_answered = true;
++			if (!dev->pong_received)
++				dev->pong_received = true;
 +			wake_up_all(&dev->verify_waitq);
 +		}
  	} else {
  		pr_warn("OdinLink: unexpected DMA ctrl message type %d\n",
  			type);
-@@ -604,8 +645,10 @@ static void odl_tb5_restart_work_fn(struct work_struct *work)
+@@ -487,7 +530,7 @@ static void odl_tb5_verify_work_fn(struct work_struct *work)
+ 	long ret;
+ 	int attempt;
+ 
+-	dev->pong_received = false;
++	dev->pong_received = false;   /* peer_ping_answered deliberately kept */
+ 
+ 	/* Use frame pool for RX during verify — each pool slot is
+ 	 * independent and auto-reposts after consumption, so we never
+@@ -513,6 +556,10 @@ static void odl_tb5_verify_work_fn(struct work_struct *work)
+ 		if (dev->state != ODL_TB5_STATE_CONNECTED)
+ 			goto out_reset;
+ 
++		/* Answering the peer's PING already proved both directions. */
++		if (dev->peer_ping_answered)
++			break;
++
+ 		flush_work(&dev->ctrl_reply_work);
+ 
+ 		ret = odl_tb5_send_dma_msg(dev, ODL_TB5_DMA_PING);
+@@ -528,7 +575,7 @@ static void odl_tb5_verify_work_fn(struct work_struct *work)
+ 
+ 		ret = wait_event_interruptible_timeout(
+ 				dev->verify_waitq,
+-				dev->pong_received,
++				dev->pong_received || dev->peer_ping_answered,
+ 				msecs_to_jiffies(100));
+ 		if (ret > 0)
+ 			break;
+@@ -544,7 +591,7 @@ static void odl_tb5_verify_work_fn(struct work_struct *work)
+ 		 * frames and creates dead windows where PONGs are lost. */
+ 	}
+ 
+-	if (!dev->pong_received) {
++	if (!dev->pong_received && !dev->peer_ping_answered) {
+ 		pr_err("OdinLink: DMA verify failed after %d attempts\n",
+ 		       attempt);
+ 		goto out_reset;
+@@ -604,8 +651,10 @@ static void odl_tb5_restart_work_fn(struct work_struct *work)
  					 dev->stale_remote_tx_hopid,
  					 dev->rx.ring->hop);
  		odl_tb5_rings_stop(dev);
@@ -126,7 +206,7 @@ index 1c1bc38..e524730 100644
  	}
  
  	mutex_lock(&dev->state_lock);
-@@ -642,6 +685,21 @@ static void odl_tb5_login_work_fn(struct work_struct *work)
+@@ -642,6 +691,21 @@ static void odl_tb5_login_work_fn(struct work_struct *work)
  				"retrying in %lu ms\n",
  				dev->login_retries, ret, delay_ms);
  
@@ -148,8 +228,16 @@ index 1c1bc38..e524730 100644
  		schedule_delayed_work(&dev->login_work,
  				      msecs_to_jiffies(delay_ms));
  	}
+@@ -688,6 +752,7 @@ int odl_tb5_proto_init(struct odl_tb5_device *dev)
+ 	dev->login_sent     = false;
+ 	dev->login_received = false;
+ 	dev->pong_received  = false;
++	dev->peer_ping_answered = false;
+ 
+ 	mutex_lock(&dev->state_lock);
+ 	dev->state = ODL_TB5_STATE_HANDSHAKE;
 diff --git a/driver/odl_tb5_ring_dma.c b/driver/odl_tb5_ring_dma.c
-index aaae32d..2162b34 100644
+index aaae32d..cacb3b8 100644
 --- a/driver/odl_tb5_ring_dma.c
 +++ b/driver/odl_tb5_ring_dma.c
 @@ -1344,14 +1344,17 @@ struct odl_tb5_stream *odl_tb5_stream_create(struct odl_tb5_device *dev,
@@ -187,6 +275,35 @@ index aaae32d..2162b34 100644
  			rcu_read_unlock();
  			return stream;
  		}
+@@ -1766,10 +1772,18 @@ bool odl_tb5_stream_can_send(struct odl_tb5_stream *stream)
+ {
+ 	struct odl_tb5_device *dev = stream->dev;
+ 	struct odl_tb5_frame_pool *pool = &dev->frame_pool;
++	bool ok;
+ 
+ 	/* Can send if we have frames available and state is ready */
+-	return dev->state == ODL_TB5_STATE_READY &&
+-	       pool && pool->free_count > ODL_TB5_TX_POOL_RESERVE;
++	ok = dev->state == ODL_TB5_STATE_READY &&
++	     pool && pool->free_count > ODL_TB5_TX_POOL_RESERVE;
++
++	if (!ok)
++		pr_info_ratelimited("odl_tb5: can_send=0 state=%d free=%d reserve=%d rx_target=%d rx_posted=%d\n",
++				    dev->state, pool ? pool->free_count : -1,
++				    ODL_TB5_TX_POOL_RESERVE, dev->rx_target,
++				    atomic_read(&dev->rx_posted));
++	return ok;
+ }
+ 
+ bool odl_tb5_stream_can_recv(struct odl_tb5_stream *stream)
+@@ -1790,6 +1804,7 @@ int odl_tb5_stream_send(struct odl_tb5_stream *stream,
+ 	struct odl_tb5_device *dev = stream->dev;
+ 	enum odl_tb5_tx_mode mode;
+ 
++
+ 	if (dev->state != ODL_TB5_STATE_READY)
+ 		return -ENOTCONN;
+ 
 diff --git a/driver/odl_tb5_service.c b/driver/odl_tb5_service.c
 index 350dbb3..6abe999 100644
 --- a/driver/odl_tb5_service.c
@@ -330,6 +447,47 @@ index ca73a50..15466f6 100644
  
  /* Ops table init */
  void odl_init_context_ops(struct ibv_context *ctx);
+diff --git a/verbs/src/odl_tb5_verbs_device.c b/verbs/src/odl_tb5_verbs_device.c
+index 2e4ee3a..3c0cbe5 100644
+--- a/verbs/src/odl_tb5_verbs_device.c
++++ b/verbs/src/odl_tb5_verbs_device.c
+@@ -106,9 +106,21 @@ struct ibv_context *odl_ibv_open_device(struct ibv_device *device)
+         return NULL;
+     }
+ 
+-    /* Set non-blocking mode on the device fd so stream_send/recv
+-     * ioctls return -EAGAIN instead of blocking. The verbs provider
+-     * uses poll() + non-blocking ioctls for true async behavior. */
++    /* Initialize context fields */
++    ctx->base.device        = device;
++    ctx->base.cmd_fd        = -1;
++    ctx->base.async_fd      = -1;
++
++    /*
++     * BUG16: this fd setup used to run BEFORE the block above, which then
++     * overwrote cmd_fd with -1. odl_worker_poll_fd() therefore always
++     * returned -EBADF, so the worker never waited for TX readiness and spun
++     * on "send EAGAIN, re-queueing" forever -- no payload ever moved.
++     * Order matters: assign the fd AFTER the defaults.
++     *
++     * Non-blocking mode makes stream_send/recv return -EAGAIN instead of
++     * blocking; the worker polls POLLOUT before retrying.
++     */
+     int dev_fd = odl_tb5_get_fd(handle);
+     if (dev_fd >= 0) {
+         int flags = fcntl(dev_fd, F_GETFL, 0);
+@@ -116,11 +128,6 @@ struct ibv_context *odl_ibv_open_device(struct ibv_device *device)
+             fcntl(dev_fd, F_SETFL, flags | O_NONBLOCK);
+         ctx->base.cmd_fd = dev_fd;
+     }
+-
+-    /* Initialize context fields */
+-    ctx->base.device        = device;
+-    ctx->base.cmd_fd        = -1;
+-    ctx->base.async_fd      = -1;
+     ctx->base.num_comp_vectors = 1;
+     ctx->dev                = odl_dev;
+     ctx->handle             = handle;
 diff --git a/verbs/src/odl_tb5_verbs_discovery.c b/verbs/src/odl_tb5_verbs_discovery.c
 new file mode 100644
 index 0000000..19826b9
