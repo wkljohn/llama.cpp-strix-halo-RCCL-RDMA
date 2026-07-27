@@ -1,8 +1,13 @@
 # OdinLink RDMA on 2× Strix Halo — consolidated results
 
-All figures measured on 2× Ryzen AI MAX+ 395 (gfx1151), kernel 7.0.0-28,
-Ubuntu 26.04, ROCm 7.2.0, single USB4 cable, with the patches in
-`patches/odinlink-verbs-and-driver-fixes.patch` applied to OdinLink-Five.
+Every number in this repo lives here. All figures measured on 2× Ryzen AI MAX+ 395
+(gfx1151), kernel 7.0.0-28, Ubuntu 26.04, ROCm 7.2.0, single USB4 cable, running
+[wkljohn/OdinLink-Five @ `strix-halo-verbs-fixes`](https://github.com/wkljohn/OdinLink-Five/tree/strix-halo-verbs-fixes)
+(equivalently, `patches/odinlink-verbs-and-driver-fixes.patch`).
+
+Recipes: [REPRODUCE-RPC.md](REPRODUCE-RPC.md) (inference) ·
+[REPRODUCE-RCCL.md](REPRODUCE-RCCL.md) (collectives). Defects:
+[FINDINGS.md](FINDINGS.md).
 
 ## Inference — 27B Q6_K (20.88 GiB), 2 nodes, `-sm layer`
 
@@ -19,6 +24,13 @@ Ubuntu 26.04, ROCm 7.2.0, single USB4 cable, with the patches in
 nodes cost ~3.6 % because `-sm layer` crosses the wire once per token. Two nodes
 are for *capacity*, not speed. RDMA recovers about half the cross-node penalty
 (8.83 → 9.16 against a 9.50 ceiling).
+
+> **Every inference figure on this page is `-sm layer` (pipeline).** Tensor
+> parallel over RDMA — the case a 13× latency win should actually transform,
+> since it all-reduces every layer — **has not been benchmarked**. RCCL binds the
+> OdinLink plugin correctly, then the world-communicator rendezvous deadlocks
+> ([FINDINGS.md](FINDINGS.md) BUG 12). The `-sm tensor` numbers in the repo root
+> are TCP-era and predate this work.
 
 ## Transport — byte-verified
 
@@ -95,6 +107,9 @@ measurement** — confirming it needs ftrace on `workqueue_queue_work` →
 same way *deliberately*, to keep RX completion single-sourced for ordering.
 
 ## Reproducing
+
+Full recipes in [REPRODUCE-RPC.md](REPRODUCE-RPC.md) and
+[REPRODUCE-RCCL.md](REPRODUCE-RCCL.md). The transport check on its own:
 
 ```bash
 # byte-verified bulk, both directions

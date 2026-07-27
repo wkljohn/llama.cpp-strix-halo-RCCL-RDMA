@@ -116,9 +116,13 @@ Recommend #1: it reuses the container that already works and keeps one ABI (7.14
 ## Economics (the honest gate)
 
 At ~290 µs/allreduce over TCP: ~120/token ≈ 35 ms/token comm — **break-even** vs the
-compute TP saves. The port is correct and will work, but over Thunderbolt-TCP it does not
-beat layer-split. It flips to **+50–75%** only with real RDMA (~30–100 µs/op) — i.e. the
-ConnectX-4-Lx-over-USB4 NIC. So: **finish the port now (cheap), buy the NIC to make it pay.**
+compute TP saves. The port is correct and works, but over Thunderbolt-TCP it does not
+beat layer-split. It flips only with a real RDMA floor (~30–100 µs/op).
+
+**Update: no NIC needed.** RDMA over the existing Thunderbolt cables measures
+**22.0 µs** median — see [../odinlink/](../odinlink/). The remaining blocker is not
+hardware but the RCCL world-communicator rendezvous deadlock (BUG 12), which is why the
+`-sm tensor` + RDMA measurement does not exist yet.
 
 Commits on `nccl-tp`: see `git log`. Related: `VLLM-TP2-STRIX-HALO.md`,
 memory `strix-halo-vllm-tensor-parallel-rccl-mod.md`.

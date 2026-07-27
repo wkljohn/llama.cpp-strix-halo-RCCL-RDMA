@@ -1,69 +1,71 @@
-# OdinLink-Five on AMD Strix Halo — measurements, bugs, and fixes
+# OdinLink-Five on Strix Halo — the bug ledger
 
-Tested 2026-07-25..27 on 2× Ryzen AI MAX+ 395 (gfx1151, USB4 Host Router `1022:158d/158e`),
-kernel 7.0.0-28-generic, gcc 15.2.0, `github.com/Geramy/OdinLink-Five` @ `ed60505`.
-Both nodes joined by 2× USB4 cables (normally bonded as `bond0`, balance-rr).
+Every defect found bringing RDMA-over-Thunderbolt up on 2× Ryzen AI MAX+ 395
+(gfx1151, USB4 Host Router `1022:158d/158e`), kernel 7.0.0-28-generic, gcc 15.2.0.
+All fixes are in [wkljohn/OdinLink-Five @ `strix-halo-verbs-fixes`](https://github.com/wkljohn/OdinLink-Five/tree/strix-halo-verbs-fixes)
+— clone that and you have them; the credits and upstream base are stated there.
 
-## TL;DR
+One entry per defect, each with its **final** diagnosis. Where a diagnosis was
+revised mid-investigation, the entry states the conclusion and
+[APPENDIX-HISTORY.md](APPENDIX-HISTORY.md) keeps the superseded reasoning —
+retractions are evidence of how the answer was reached, not embarrassments to
+delete.
 
-RDMA-over-Thunderbolt **works on AMD USB4 hardware** (the project targets Intel TB5).
-Measured **22.4 µs median** round-trip vs **286 µs/op** for the same collective over TCP —
-a **~13× latency improvement** on the existing cables, no new NIC.
-Three real bugs block a smooth bring-up; all have workarounds, two have concrete patches.
+Numbers live in [RESULTS.md](RESULTS.md). Recipes live in
+[REPRODUCE-RPC.md](REPRODUCE-RPC.md) and [REPRODUCE-RCCL.md](REPRODUCE-RCCL.md).
 
-## Measurements (node1 ↔ node2, single USB4 link, `e2e=0`)
+## Index
 
-Latency (`odl_tb5_cli client -t latency -i 1000`):
+| # | defect | effect | status |
+|---|---|---|---|
+| 1 | XDomain hop-ID / path leak on teardown | `enable_paths -12` on every load after the first | **fixed here** |
+| 2 | Two cables ⇒ both services at `route=2` | login handshake never completes | workaround `max_devices=1` |
+| 3 | `e2e=0` honoured but logged "enabled" | cosmetic; costs debugging time | reported |
+| 4 | Plugins hardcode 80 Gb/s link speed | bad RCCL topology/chunking decisions | reported |
+| 5 | Service unbind sends a peer logout | handshake churn | reported |
+| 6 | RCCL plugin exports `rcclNetPlugin_v7` | plugin invisible; silent TCP fallback | fixed; also in PR #20 |
+| 7 | Vendored `net_v7.h` matches no real ABI | segfault as soon as RCCL calls in | PR #20 |
+| 8 | RCCL plugin data path is a stub | cannot move correct data | PR #20 |
+| 9 | *(withdrawn)* IOMMU fault blamed on upstream | was a local use-after-free | **retracted** |
+| 10 | DMA-verify handshake is an unwinnable race | second node **always** fails to reach READY | **fixed here** |
+| 11 | No discovery path at all | `ibv_devices` empty — invisible to every RDMA app | **fixed here** |
+| 12 | RCCL world-communicator rendezvous deadlock | 27B TP run hangs at startup | **open** (llama.cpp port side) |
+| 13 | `ibv_post_recv` performed a blocking receive | pre-posting always failed → `RDMA activate failed` | **fixed here** |
+| 14 | `ibv_post_send` kept the caller's stack WR | worker read freed stack; completions unmatchable | **fixed here** |
+| 15 | `modify_qp` discarded `IBV_QP_DEST_QPN` | sends addressed to `dst_id 0` | **fixed here** |
+| 16 | `cmd_fd` assigned then overwritten with `-1` | `poll()` always `-EBADF`; worker busy-spun | **fixed here** |
+| 17 | `POLLOUT` required a *previous* TX to complete | 5 s per message, measured | **fixed here** |
+| 18 | Verify clears the proof a peer PING provided | stuck `CONNECTED`; every send `-EAGAIN` | **fixed here** |
+| 19 | `ibv_poll_cq` blocked holding the CQ lock | self-deadlock against its own producer | **fixed here** |
+| 20 | Full-size frames exactly equal the RX buffer | **every multi-frame message lost all full fragments** | **fixed here** |
+| 21 | Send completed before the payload was on the wire | silent data corruption at 979 MiB/s | **fixed here** |
+| 22 | No fragment sequencing in the wire header | a dropped fragment becomes a silent short message | **fixed here** |
+| 23 | Bidirectional traffic deadlocks (three causes) | the 27B blocker | **fixed here** |
 
-| metric | value |
-|---|---|
-| min | 13.60 µs |
-| **median (p50)** | **22.42 µs** |
-| avg | 23.59 µs |
-| p95 / p99 | 33.52 / 34.62 µs |
-| p99.9 / max | 68.55 µs |
-| jitter (stddev) | 4.01 µs |
-
-Distribution: 96.2 % of samples in 20–50 µs, 3.7 % in 10–20 µs, 0.1 % > 50 µs.
-
-Bandwidth (`-t bandwidth`): **8.38–9.22 Gb/s (1.05–1.15 GB/s)** on one link.
-Driver reports the true link as `10 Gb/s (x2 lanes)`. So ~46 % of line rate — bandwidth is
-*not* this transport's strength; **latency is**.
-
-Reference points on the same hardware:
-- RCCL all-reduce over TCP/bond0: **286 µs/op**
-- TCP throughput over bonded 2× links (iperf3): ~19 Gb/s
-- Thunderbolt ping (ICMP, IP stack): ~0.5–0.8 ms
-
-## Why this matters
-
-Cross-node tensor parallelism here is latency-bound. At 286 µs/op the per-layer all-reduce
-dominates and pipeline (`-sm layer`) beats TP. At ~22 µs the comm term drops ~13×, which is
-the regime where TP-RCCL can plausibly overtake pipeline. The RCCL net plugin
-(`librccl_net_odl_tb5.so`) builds and its plugin API tests pass, so the path exists —
-but see BUG 4 before benchmarking.
+"Fixed here" means the patch is on the
+[`strix-halo-verbs-fixes` branch](https://github.com/wkljohn/OdinLink-Five/tree/strix-halo-verbs-fixes)
+and in `patches/odinlink-verbs-and-driver-fixes.patch`. "PR #20" refers to
+[OdinLink PR #20](https://github.com/Geramy/OdinLink-Five/pull/20), an independent
+fix for the same defects, cited for attribution.
 
 ---
 
 # BUG 1 — XDomain hop-ID / path leak → `ENOMEM` on every load after the first
 
-**Severity: high.** This is the one that forces reboots.
+**Severity: high.** This is the one that used to force reboots.
 
-### Symptom
-The first `insmod` after a boot reaches `entering READY state`. Every subsequent load (or
-service re-probe, e.g. after the peer reboots) fails:
+The first `insmod` after a boot reaches `entering READY state`. Every subsequent
+load — or service re-probe, e.g. after the peer reboots — fails:
 
 ```
 OdinLink: enable_paths failed (-12), retry 1..5
 OdinLink: failed to enable XDomain paths after 5 attempts: -12
-OdinLink: connection completion failed (-12), retrying handshake
 ```
 
-`-12` = `ENOMEM` from `tb_xdomain_enable_paths()` — the Thunderbolt core is out of
+`-12` = `ENOMEM` from `tb_xdomain_enable_paths()`: the Thunderbolt core is out of
 hop-ID/tunnel resources because previous instances never released theirs.
 
-### Root cause A — `remove()` releases only in two states
-`driver/odl_tb5_service.c:209`:
+**Root cause A — `remove()` releases only in two states** (`odl_tb5_service.c:209`):
 
 ```c
 if (saved_state == ODL_TB5_STATE_CONNECTED ||
@@ -73,30 +75,29 @@ if (saved_state == ODL_TB5_STATE_CONNECTED ||
 }
 ```
 
-`tb_xdomain_alloc_in_hopid()` is called in `odl_tb5_complete_connection()`
-(`odl_tb5_proto.c:293`). If the device is removed/unbound while in **HANDSHAKE**,
-**DISCONNECTED** or **ERROR** — which is exactly what happens when a handshake is retrying,
-when the peer disappears, or when the user unbinds a service — the hop ID and paths are
-**never released**.
+`tb_xdomain_alloc_in_hopid()` is called in `odl_tb5_complete_connection()`. If the
+device is removed while in **HANDSHAKE**, **DISCONNECTED** or **ERROR** — exactly
+what happens when a handshake is retrying, the peer disappears, or a service is
+unbound — the hop ID and paths are **never released**.
 
-### Root cause B — restart path releases a possibly-stale hop ID
-`driver/odl_tb5_proto.c:601-608` releases `dev->stale_remote_tx_hopid`, but that field is
-only assigned in the peer-login handler (lines 165, 191). A restart triggered by
-**DMA-verify failure** (`DMA verify failed after 300 attempts`) does not pass through those
-lines, so `stale_remote_tx_hopid` can differ from the currently allocated
-`remote_tx_hopid` → the wrong ID is released and the live one leaks.
+**Root cause B — the restart path releases a possibly-stale hop ID.**
+`odl_tb5_proto.c:601-608` releases `dev->stale_remote_tx_hopid`, but that field is
+only assigned in the peer-login handler. A restart triggered by DMA-verify failure
+does not pass through those lines, so the wrong ID is released and the live one leaks.
 
-### Suggested fix
-Track the allocation explicitly instead of inferring it from connection state:
+**Root cause C — `complete_connection()` re-entry.** The function calls
+`tb_xdomain_alloc_in_hopid()` unconditionally at its head and overwrites
+`dev->in_hopid`. It is re-entered on **every** handshake restart, so each retry
+orphans the previous allocation. Tracking `in_hopid_valid` alone was not enough —
+a node still hit `enable_paths -12` after a handful of restarts.
+
+**Fix.** Track the allocation explicitly, release on every teardown path, and
+release *before* re-allocating on re-entry:
 
 ```c
 /* odl_tb5_core.h */
 bool in_hopid_valid;
 int  in_hopid;            /* the value actually passed to alloc_in_hopid() */
-
-/* complete_connection(), after a successful alloc */
-dev->in_hopid       = dev->remote_tx_hopid;
-dev->in_hopid_valid = true;
 
 /* one helper used by remove(), restart, and every error path */
 static void odl_tb5_release_paths(struct odl_tb5_device *dev)
@@ -112,27 +113,20 @@ static void odl_tb5_release_paths(struct odl_tb5_device *dev)
         tb_xdomain_release_in_hopid(dev->xd, dev->in_hopid);
         dev->in_hopid_valid = false;
 }
+
+/* complete_connection(), at the head — re-entry drops the old one first */
+if (dev->in_hopid_valid)
+        odl_tb5_release_paths(dev);
+ret = tb_xdomain_alloc_in_hopid(dev->xd, dev->remote_tx_hopid);
 ```
 
-Call it unconditionally in `odl_tb5_remove()` (drop the state check) and in the restart
-path (replacing the `stale_remote_tx_hopid` logic). Releasing when nothing is allocated
-becomes a no-op, so it is safe on all paths.
+Releasing when nothing is allocated is a no-op, so the helper is safe everywhere.
+Apply it **after** the existing teardown body, never in place of it — replacing it
+is what produced the retracted BUG 9 (see [APPENDIX-HISTORY.md](APPENDIX-HISTORY.md)).
 
-### Workaround — **no reboot required** (verified 2026-07-27)
-Reloading the whole Thunderbolt stack tears down the domain and frees every hop ID:
-
-```bash
-sudo rmmod odl_tb5
-sudo rmmod thunderbolt_net      # bond0 drops briefly
-sudo rmmod thunderbolt          # frees all XDomain tunnels/hop IDs
-sudo modprobe thunderbolt
-sudo modprobe thunderbolt_net   # thunderboltN reappear, re-enslaved to bond0 automatically
-sudo insmod odl_tb5.ko e2e=0
-```
-
-Verified: after this, `enable_paths` succeeded and both nodes reached READY without a
-reboot. Peer rediscovery took ~5 s; `bond0` came back up at 20 Gb/s on its own.
-Local GPU/inference workloads are untouched (they do not use Thunderbolt).
+**Scope note.** The leak is not only an `insmod`-time problem. *Any* workload that
+opens and closes the device repeatedly exhausts hop-IDs — which is what made a
+long-running RCCL job fail with `ncclSystemError` before this was fixed.
 
 ---
 
@@ -140,8 +134,7 @@ Local GPU/inference workloads are untouched (they do not use Thunderbolt).
 
 **Severity: high** on any host with two or more Thunderbolt cables to the same peer.
 
-### Symptom
-With both USB4 cables connected, each side *receives* the peer's login and *sends* a
+With both USB4 cables connected each side *receives* the peer's login and *sends* a
 response with `ret=0`, but its own request always times out:
 
 ```
@@ -150,11 +143,8 @@ OdinLink: sent login response (ret=0, route=2, sn=0, tx_hopid=9)
 OdinLink: login request failed: -110          <-- ETIMEDOUT, forever
 ```
 
-The handshake never completes. Zero progress until one service is unbound.
-
-### Root cause
-`odl_tb5_find_device_by_route(u64 route)` (`odl_tb5_proto.c:78`) resolves the target device
-by route **alone**. With two USB4 host routers (two domains), *both* peer services sit at
+`odl_tb5_find_device_by_route(u64 route)` (`odl_tb5_proto.c:78`) resolves the target
+device by route **alone**. With two USB4 host routers both peer services sit at
 `route=2`:
 
 ```
@@ -162,15 +152,15 @@ by route **alone**. With two USB4 host routers (two domains), *both* peer servic
 1-2.1  prtcid=20300  route=2      <- domain 1
 ```
 
-so the lookup returns whichever matches first and the response is dispatched onto the wrong
-xdomain — it never reaches the requester.
+so the lookup returns whichever matches first and the response is dispatched onto
+the wrong xdomain.
 
-### Suggested fix
-Disambiguate by domain as well as route, or match on the `tb_xdomain` pointer directly:
+**Suggested fix** — match on the `tb_xdomain` pointer, which the XDomain callback
+already has:
 
 ```c
 static struct odl_tb5_device *
-odl_tb5_find_device(const struct tb_xdomain *xd)          /* preferred */
+odl_tb5_find_device(const struct tb_xdomain *xd)
 {
         list_for_each_entry(dev, &odl_tb5_devices, list)
                 if (dev->xd == xd)
@@ -179,30 +169,20 @@ odl_tb5_find_device(const struct tb_xdomain *xd)          /* preferred */
 }
 ```
 
-The XDomain callback already has the originating `tb_xdomain`, so no route matching is
-needed. If route matching must be kept, key on
-`(tb_xdomain_parent(xd)->index, route)` rather than `route`.
+If route matching must be kept, key on `(tb_xdomain_parent(xd)->index, route)`.
 
-### Workaround
-Bind only one service per node:
-
-```bash
-echo 1-2.1 | sudo tee /sys/bus/thunderbolt/drivers/odl_tb5/unbind
-```
-
-(or physically unplug one of the two cables — cleaner, because it also avoids BUG 5).
+**Workaround.** Bind exactly one service *from the start*, via the module parameter
+added here — `max_devices=1`. Unbinding afterwards works but triggers BUG 5.
 
 ---
 
 # BUG 3 — `e2e=0` is honoured but logged as "enabled" (cosmetic)
 
-`driver/odl_tb5_ring_dma.c:476` prints `(E2E enabled, e2e_tx_hop=%d)` unconditionally.
-The parameter itself works correctly — `/sys/module/odl_tb5/parameters/e2e` reads `N` and
-`RING_FLAG_E2E` is not set (`odl_tb5_ring_dma.c:448`) — but the log claims otherwise, which
-costs debugging time when following the module's own `e2e=0` advice for TB3-class
-controllers.
+`driver/odl_tb5_ring_dma.c:476` prints `(E2E enabled, e2e_tx_hop=%d)`
+unconditionally. The parameter itself works correctly, but the log claims otherwise
+— which costs debugging time when following the module's own `e2e=0` advice for
+TB3-class controllers.
 
-### Suggested fix
 ```c
 "local_tx_hopid=%d (E2E %s, e2e_tx_hop=%d)\n", ..., odl_e2e ? "enabled" : "disabled", ...
 ```
@@ -217,47 +197,22 @@ controllers.
 props->speed = 80000;      /* TB5 spec number, not measured */
 ```
 
-On this hardware the driver itself reports the true link as **10 Gb/s × 2 lanes**, and the
-measured payload rate is **~9.2 Gb/s** — off by ~9×. NCCL/RCCL feed `props->speed` into
-topology/cost estimation (ring vs tree, chunk sizing), so an inflated value can produce bad
-algorithm and chunking decisions.
+The driver itself reports the true link as **10 Gb/s × 2 lanes** and the measured
+payload rate is **~9.2 Gb/s** — off by ~9×. RCCL feeds `props->speed` into topology
+and cost estimation (ring vs tree, chunk sizing), so an inflated value produces bad
+algorithm decisions.
 
-### Suggested fix
-Report the real speed; the driver already exposes it through the `GET_PEER` ioctl
-(`struct odl_tb5_peer_info.speed`, used by the CLI to print "Link speed: 10 Gb/s (x2
-lanes)"). Query it in `getProperties()` and fall back to a conservative default only if the
-ioctl returns 0.
+**Fix:** query the real speed, already exposed through the `GET_PEER` ioctl
+(`struct odl_tb5_peer_info.speed`), and fall back to a conservative default only if
+the ioctl returns 0.
 
 ---
 
-# BUG 5 — unbinding a service triggers a peer logout → handshake churn (minor)
+# BUG 5 — unbinding a service triggers a peer logout (minor)
 
-Unbinding one service (the BUG 2 workaround) sends a logout that resets the peer's state
-machine (`received logout from peer` → `connection restarted, beginning handshake`), so both
-sides re-run the handshake. Combined with BUG 1 this used to leak another hop ID each time.
-Fixing BUG 2 removes the need to unbind at all; otherwise consider suppressing logout when
-the removal is a local administrative unbind rather than a link loss.
-
----
-
-# Working bring-up procedure (with current upstream code)
-
-1. Ensure a clean Thunderbolt state — either fresh boot, or the BUG 1 stack-reload above.
-2. `sudo insmod odl_tb5.ko e2e=0` on **both** nodes (peer must be present).
-3. Unbind the second service on both nodes (BUG 2), or run with a single cable.
-4. Wait for `OdinLink: entering READY state` in `dmesg` on **both** sides.
-5. Server: `./build/cli/odl_tb5_cli server -d <N> -v`
-   Client: `./build/cli/odl_tb5_cli client -d <N> -t latency|bandwidth`
-
-Notes:
-- The `/dev/odl_tb5_N` index is assigned by probe order and **differs between nodes** —
-  read it from `ls /dev/odl_tb5_*` rather than assuming 0.
-- The driver logs under **two** prefixes: `odl_tb5:` (load/probe) and `OdinLink:`
-  (handshake/DMA). Grepping only the first hides every interesting failure.
-- Start the server over ssh with `exec` in a held session; `setsid ... &` gets orphaned and
-  dies silently (empty log).
-- `odl_tb5` coexists with `thunderbolt_net`: it is a separate XDomain service
-  (`prtcid=20300` vs `1`), so `bond0` and IP traffic keep working while RDMA is active.
+Unbinding one service (the old BUG 2 workaround) sends a logout that resets the
+peer's state machine, so both sides re-run the handshake. Combined with BUG 1 this
+leaked another hop ID each time. Using `max_devices=1` avoids the unbind entirely.
 
 ---
 
@@ -265,37 +220,32 @@ Notes:
 
 **Severity: high.** Makes the plugin invisible; RCCL silently falls back to TCP.
 
-### Symptom
 ```
-NCCL INFO NCCL_NET_PLUGIN set by environment to ODL_TB5
 NCCL INFO External network plugin /path/librccl-net-ODL_TB5.so is unsupported
 NCCL INFO NET/Socket : Using [0]bond0:10.4.0.1<0>      <-- silent TCP fallback
 ```
 
-### Root cause
 `rccl/src/odl_tb5_plugin.c:375` defines the entry point as **`rcclNetPlugin_v7`**.
-RCCL — like NCCL — resolves net plugins by the symbol **`ncclNetPlugin_v<N>`**
-(confirmed: `strings librccl.so.1` lists `ncclNetPlugin_v6..v11`, no `rccl*` variants).
-The symbol never matches, so the plugin is rejected and RCCL falls back to sockets
-**without an error** — users get zero RDMA benefit and no indication why.
+RCCL — like NCCL — resolves net plugins by **`ncclNetPlugin_v<N>`** (`strings
+librccl.so.1` lists `ncclNetPlugin_v6..v11`, no `rccl*` variants). The symbol never
+matches and the plugin is rejected **without an error**.
 
-### Fix (applied and verified)
 ```c
 extern rcclNet_v7_t ncclNetPlugin_v7 __attribute__((alias("rcclNetPlugin_v7")));
 ```
-After rebuilding, `nm -D` shows both `ncclNetPlugin_v7` and `rcclNetPlugin_v7`, and RCCL
-loads the plugin instead of rejecting it.
+
+See [REPRODUCE-RCCL.md](REPRODUCE-RCCL.md) for the two *further* discovery traps
+(filename form, and `NCCL_PLUGIN_DIR` not being honoured) that also end in silent TCP.
 
 ---
 
 # BUG 7 — the vendored net API does not match the real NCCL/RCCL ABI
 
 **Severity: critical.** Once BUG 6 is fixed and the plugin actually loads, both ends
-**segfault** (SIGSEGV/139) as soon as RCCL calls into it.
+**segfault** as soon as RCCL calls into it.
 
-### Root cause
-`third_party/rccl/net_v7.h` defines a struct that matches **no** real NCCL/RCCL version.
-Compared against the genuine `ncclNet_v7_t` (NVIDIA nccl `plugins/net/example/nccl/net_v7.h`):
+`third_party/rccl/net_v7.h` defines a struct matching **no** real NCCL/RCCL version.
+Against the genuine `ncclNet_v7_t`:
 
 | slot | OdinLink `rcclNet_v7_t` | real `ncclNet_v7_t` |
 |---|---|---|
@@ -304,464 +254,509 @@ Compared against the genuine `ncclNet_v7_t` (NVIDIA nccl `plugins/net/example/nc
 | 9 | `irecv` | **`deregMr`** |
 | — | *(absent)* | `getDeviceMr`, `irecvConsumed` |
 
-Signatures also differ: real `isend` takes an `mhandle`; real `irecv`/`iflush` are
-**multi-buffer** (`int n, void** data, int* sizes, int* tags, void** mhandles`), OdinLink's
-are single-buffer. So RCCL calls `regMr` at the offset holding `closeListen`, with
-mismatched arguments → immediate crash.
+Signatures differ too: real `isend` takes an `mhandle`; real `irecv`/`iflush` are
+multi-buffer. So RCCL calls `regMr` at the offset holding `closeListen` → immediate
+crash. The NCCL-side plugin declares only `_v4`/`_v5`, which modern RCCL will not load.
 
-The NCCL-side plugin (`nccl/src/odl_tb5_nccl_plugin.c`) is closer to the real API but
-declares only `ncclNetPlugin_v4`/`_v5`, which modern RCCL (v6+ only) will not load, and its
-`connect`/`accept`/`irecv` signatures are likewise non-standard.
-
-### Suggested fix
-Rebuild both plugins against the **official** headers from
-`github.com/NVIDIA/nccl` → `plugins/net/example/nccl/net_v*.h`, using
-`plugins/net/example/plugin.c` as the reference skeleton (it also shows how to layer old
-API versions on top of a newer implementation). Target v7 or newer.
+**Fix:** rebuild against the official headers from `NVIDIA/nccl`
+(`plugins/net/example/nccl/net_v*.h`), targeting v7 or newer. Upstream **PR #20**
+does this.
 
 ---
 
 # BUG 8 — the RCCL plugin's data path is a non-functional stub
 
-**Severity: critical.** Even with BUG 6 + BUG 7 fixed, the plugin cannot move correct data.
+**Severity: critical.** Even with BUG 6 + 7 fixed the plugin cannot move correct data.
 
 1. **`isend`/`irecv` treat the data pointer as a file descriptor**
    (`odl_tb5_plugin.c:290,315`):
    ```c
    odl_tb5_send_dmabuf(comm->handle, (int)(intptr_t)data, 0, size);
    ```
-   `odl_tb5_send_dmabuf()` expects a **dmabuf FD**, but NCCL passes a **memory pointer**.
-   Casting the pointer to `int` yields a meaningless FD.
-2. **`test()` never polls for completion** — zero calls to `odl_tb5_poll` /
-   `odl_tb5_wait_tx` / `odl_tb5_wait_rx` anywhere in the plugin. It unconditionally sets
-   `*done = 1`, so NCCL believes every transfer finished instantly.
-3. `iflush` is a no-op with a non-standard signature (`(void*, int dev, void**)`).
+   `odl_tb5_send_dmabuf()` expects a dmabuf FD; NCCL passes a memory pointer.
+2. **`test()` never polls for completion** — it unconditionally sets `*done = 1`, so
+   NCCL believes every transfer finished instantly.
+3. `iflush` is a no-op with a non-standard signature.
 
-### Consequence
-The RCCL plugin is a skeleton, not an implementation. A working version needs real buffer
-handling (`odl_tb5_tx_buffer`/`rx_buffer` + copy, or genuine dmabuf registration through
-`regMr`), real completion tracking via `odl_tb5_poll`, tag matching, and multi-receive
-support.
+The suggested alternative in upstream's docs — `NCCL_NET_PLUGIN=IB` with
+`NCCL_IB_HCA=odl_tb5` — does not work either: the driver registers no kernel RDMA
+device, and substituting `libodl_tb5_verbs.so` for `libibverbs.so.1` fails because
+RCCL requires versioned symbols (`IBVERBS_1.1/1.8/1.10/1.12`) it does not export.
 
-### Status of the verbs alternative (also closed)
-OdinLink's docs suggest `NCCL_NET_PLUGIN=IB` + `NCCL_IB_HCA=odl_tb5` instead. That does not
-work here either:
-- the driver is a **Thunderbolt service driver**, not a kernel RDMA driver, so nothing
-  appears under `/sys/class/infiniband` and `ibv_devinfo` reports "No IB devices found";
-- substituting `libodl_tb5_verbs.so` for `libibverbs.so.1` fails because RCCL requires
-  **versioned** symbols (`IBVERBS_1.1/1.8/1.10/1.12`) that the OdinLink library does not
-  export.
-
-**Net effect:** RDMA-over-Thunderbolt is real and fast at the driver level (22.4 µs), but
-there is currently **no working path from RCCL to it** — neither plugin nor verbs.
+**Superseded by PR #20**, found open on the same hardware class. It rewrites the plugin
+host-staged (`NCCL_PTR_HOST`) with a per-connection FIFO worker, fixes the ABI
+including a `char[128]`-vs-`char*` properties defect not identified here, and raises
+the driver's per-stream `rx_queue_max` from 256 to 65536 — a ~1 MB message chunks
+into ~264 frames, so the queue filled and `odl_tb5_rx_callback()` **silently dropped**
+frames under duplex load. That is why collectives hung rather than merely crashed.
+PR #20 reports TP=2 Llama-3.1-8B beating TCP by ~17–26 % on decode.
 
 ---
 
-# UPDATE 2026-07-27 — upstream PR #20 supersedes BUG 6/7/8
+# BUG 9 — WITHDRAWN: the IOMMU fault was a local use-after-free
 
-After these findings were written, **[OdinLink PR #20](https://github.com/Geramy/OdinLink-Five/pull/20)**
-("Strix Halo (gfx1151) over Thunderbolt: fix RX-queue overflow hang + ncclNet_v7 ABI") was found
-open against the same repo, on the **same hardware class**. It fixes BUG 6/7/8 and one further
-defect not identified here, and reports TP=2 Llama-3.1-8B serving over OdinLink **beating
-TCP-over-`thunderbolt0` by ~17–26 % on decode**.
+Earlier revisions of this file asserted that the driver hands the NHI unmapped
+addresses, and told readers never to load it. **Both claims were wrong.**
+`odl_tb5_rings_alloc()` uses `dma_alloc_coherent(tb_ring_dma_device(...))` — the
+correct API against the correct device.
 
-Its independent measurements agree with ours: ~9 Gbit/s bulk bandwidth, attributed to the
-**USB4v1 cable** (the routers are `gen=4`/v2-capable, so a TB5 cable should scale it).
+The crashes were produced by a **locally patched build**: while adding the BUG 1 fix,
+a bad patch to `odl_tb5_remove()` silently deleted its entire cleanup body, freeing
+the device and its coherent DMA rings while the NHI was still transferring into them.
+That is an exact mechanism for `IO_PAGE_FAULT` at a stale address, the USB4 router
+wedge that follows, and — because the router shares a firmware/power domain with the
+iGPU on Strix Halo — the `amdgpu` probe failure on the next boot.
 
-### What PR #20 changes
-1. **driver — RX-queue overflow (the real hang blocker).** Per-stream `rx_queue_max` was 256,
-   but one ~1 MB message chunks into ~264 frames. Under sustained duplex load the queue fills
-   and `odl_tb5_rx_callback()` **silently drops** frames — there is no backpressure — so any
-   consumer assuming lossless in-order delivery desyncs permanently and RCCL's recv blocks
-   forever. Raised to 65536, plus RCU-safe stream lookup
-   (`hash_*_rcu` + `kref_get_unless_zero`).
-   *This was not diagnosed in our own investigation and is the reason collectives hang rather
-   than merely crash.*
-2. **rccl — `ncclNet_v7` ABI + host-staged plugin rewrite.** Same defects as BUG 7/8 here,
-   plus one we missed: properties used `char[128]` where the real ABI has `char*`, so RCCL
-   dereferenced a string as a pointer. Rewritten host-staged (`NCCL_PTR_HOST`) with a
-   per-connection FIFO worker, single-frame chunking and a 4-byte length header.
-3. **`odl_stress.c`** — an RCCL-free reproducer for the desync.
+With the upstream teardown order restored, **3/3 `rmmod` + `insmod` cycles**: no
+`IO_PAGE_FAULT`, no oops, no `enable_paths -12`, GPU healthy, no reboot needed.
 
-### Applying it
-```bash
-gh pr diff 20 --repo Geramy/OdinLink-Five > pr20.diff   # or curl .../pull/20.diff
-git apply pr20.diff
-cd build && make                 # rebuilds librccl_net_odl_tb5.so
-cd ../driver && make             # rebuilds odl_tb5.ko with the queue fix
-```
-Verify: `nm -D --defined-only build/rccl/librccl_net_odl_tb5.so | grep NetPlugin`
-should list **`ncclNetPlugin_v7`** (the name RCCL resolves).
-
----
-
-# OPERATIONAL NOTES — Thunderbolt bond recovery (learned the hard way)
-
-Reloading the Thunderbolt stack (the BUG 1 no-reboot workaround) disturbs the **IP bond** that
-shares the same cables. Symptoms and fixes:
-
-1. **Stale ARP after `thunderbolt_net` reload.** New interfaces get new MACs; the peer's ARP
-   entry goes stale/`INCOMPLETE` and traffic blackholes in one direction only.
-   ```bash
-   sudo ip neigh flush dev bond0
-   ```
-2. **A slave can come back "up" but carry no traffic.** `carrier=1` and `operstate=up` on both,
-   yet one link receives nothing. With `balance-rr` the bond keeps striping onto the dead slave,
-   producing ~50–66 % packet loss (SSH dies, RPC connects fail) while ping *partially* works —
-   an easy symptom to misread as "peer is down".
-   Identify the dead slave by per-interface counters during a ping:
-   ```bash
-   for i in thunderbolt0 thunderbolt1; do
-     echo "$i $(cat /sys/class/net/$i/statistics/rx_packets)"; done
-   ```
-   Then drop it: `sudo ip link set thunderbolt1 down` → bond runs single-link, 0 % loss.
-3. **Keep a non-Thunderbolt path to the peer.** All of the above is only debuggable if you can
-   still reach the other node — use the LAN/Wi-Fi address, not the bond, for recovery.
-4. **`odl_tb5` and `thunderbolt_net` coexist** (different XDomain services, `prtcid=20300` vs
-   `1`), so RDMA and IP run over the same cables simultaneously — but a stack reload resets
-   *both*, so expect to re-check the bond every time.
-
----
-
-# OPEN — PR #20 plugin loads and is selected, but `ncclCommInitRank` fails
-
-Status 2026-07-27 with PR #20 applied, both nodes READY, single USB4 link, one channel.
-
-**The plugin is genuinely in use** — this is the first configuration where RCCL does not fall
-back to sockets:
-
-```
-NCCL INFO Successfully loaded external network plugin .../librccl-net-ODL_TB5.so
-NCCL INFO Initialized NET plugin ODL_TB5
-NCCL INFO Assigned NET plugin ODL_TB5 to comm
-NCCL INFO Using network ODL_TB5
-NCCL INFO Channel 00/01 : 0 1
-```
-
-**But communicator creation then fails** on both ranks:
-
-```
-[Proxy Service] .../transport/net_tmp.cc:1006 -> 2      # 2 = ncclSystemError
-                .../transport/net_tmp.cc:540  -> 2
-                .../transport.cc:47 -> 2 ; transport.cc:196 -> 2
-                .../transport/generic.cc:25 -> 2
-                .../init.cc:2050 -> 2 ; 2413 -> 2 ; 2970 -> 2 ; 3001 -> 2
-ggml_cuda_world_init_once: ncclCommInitRank failed: unhandled system error
-```
-
-i.e. the failure is in the **net-transport proxy connection setup**, not in plugin discovery,
-symbol resolution, or the ABI.
-
-### Ruled out
-- **Device exclusivity** — `/dev/odl_tb5_0` opens twice concurrently without error, and the
-  PR #20 plugin already refcounts a single global handle (`g_handle` / `g_handle_refs`).
-- **Channel count** — same failure with `NCCL_MIN_NCHANNELS=1 NCCL_MAX_NCHANNELS=1`
-  (`Channel 00/01`), so it is not TX/RX buffer contention across channels.
-- **Link state** — both nodes reached `entering READY state` immediately before the run, and
-  `odl_tb5_cli` latency/bandwidth tests pass on the same link.
-- **ABI/symbol** — `ncclNetPlugin_v7` resolves; RCCL logs "Using network ODL_TB5".
-
-### Suspected difference from the PR's tested setup
-PR #20 was validated with **vLLM TP=2 (Ray)**. This workload is
-[llama.cpp-strix-halo-RCCL-RDMA](https://github.com/wkljohn/llama.cpp-strix-halo-RCCL-RDMA),
-which builds the communicator with **`ncclCommInitRank` from two independent processes on two
-machines** (rank 0 = `llama-bench`, rank 1 = `ggml-rpc-server`), rendezvousing via a TCP
-`ncclUniqueId` exchange. That drives a different `listen`/`connect`/`accept` ordering through
-the plugin than a Ray-launched SPMD job, and the two sides initialise at different times
-(rank 1 lazily, on its first `GGML_OP_ALLREDUCE`).
-
-Worth checking in the plugin: whether `connect()`/`accept()` tolerate being called before the
-peer's corresponding call (NCCL requires returning `ncclSuccess` with `*sendComm == NULL` /
-`*recvComm == NULL` so it can be retried, rather than returning an error), and whether the
-5 s `odl_tb5_wait_peer()` inside `connect()` can trip when the peer process has not yet
-reached its own init.
-
-### CORRECTION — the `ncclCommInitRank` failure is BUG 1, not a plugin defect
-
-The "suspected difference from the PR's tested setup" above (connect/accept retry semantics)
-is **probably wrong**. Checking the link state immediately after a failing run showed it had
-already left READY *before* the benchmark started:
-
-```
-node2:  enable_paths failed (-12) -> failed to enable XDomain paths after 5 attempts
-node1:  DMA ping attempt 250, still waiting for pong / peer restarted
-```
-
-That is **BUG 1 (the XDomain hop-ID leak)**. The plugin opens and closes the device on every
-comm setup; each cycle restarts the link, and after enough cycles the peer exhausts hop-IDs.
-With the link not READY, `get_shared_handle()`'s `odl_tb5_wait_peer(handle, 10000)` times out
-and returns `rcclSystemError`, so `listen`/`connect` fail and RCCL's net proxy surfaces
-`ncclSystemError` from `net_tmp.cc` — which is exactly the chain observed.
-
-**Implication:** the hop-ID leak is not only an `insmod`-time problem. *Any* workload that
-opens/closes the device repeatedly will eventually exhaust hop-IDs. Until BUG 1 is fixed, a
-long-running RCCL job on this transport is not reliable, and the TB-stack-reload workaround
-must be run immediately before each attempt.
-
-**Second-order problem:** the stack-reload workaround itself disturbs `thunderbolt_net`. After
-several reload cycles the IP bond between the nodes stopped passing traffic in both directions
-(interfaces `UP`, slaves `UP`, zero `rx_packets`) while XDomain control messages still flowed —
-i.e. the Thunderbolt fabric was fine but the network driver had desynced. Recovering that
-needed a reboot. Fixing BUG 1 properly (patch above) removes the need for the reload entirely
-and is the highest-value change for anyone trying to use this transport in anger.
-
----
-
-# ⚠ HAZARD — repeated module reloads can wedge the USB4 controller *and* the GPU
-
-**Severity: critical.** This is a hardware-integrity issue, not an inconvenience. Observed on
-both nodes after several `rmmod odl_tb5 / thunderbolt_net / thunderbolt` + `modprobe` cycles
-(the BUG 1 workaround). On the *following* boot:
-
-```
-amdgpu 0000:c5:00.0: psp reg (0x16080) wait timed out
-amdgpu 0000:c5:00.0: PSP create ring failed! / PSP firmware loading failed
-amdgpu 0000:c5:00.0: hw_init of IP block <psp> failed -22
-amdgpu 0000:c5:00.0: Fatal error during GPU init
-amdgpu 0000:c5:00.0: probe with driver amdgpu failed with error -22
-thunderbolt 0000:c7:00.6: probe with driver thunderbolt failed with error -110
-BUG: kernel NULL pointer dereference
-```
-
-and on the peer, the mechanism is explicit:
-
-```
-thunderbolt 0000:c8:00.6: AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x0043
-                                                address=0xecce8000 flags=0x0020]
-```
-
-**An IOMMU page fault on the Thunderbolt controller** — i.e. the NHI DMA engine was still
-armed and wrote into unmapped memory while the controller was being torn down. That wedges
-the USB4 router, and (because they share the same power/firmware domain on Strix Halo) the
-GPU's PSP fails to load its firmware on the next boot, so **amdgpu does not come up at all**.
-Recovery required a full power cycle.
-
-### Why this happens
-`odl_tb5_remove()` cancels work items and calls `odl_tb5_rings_stop()`, but the ring
-teardown is not ordered against in-flight NHI DMA, and (BUG 1) the XDomain paths are not
-always disabled first. Unloading `thunderbolt` underneath a driver whose rings may still be
-live is therefore unsafe.
-
-### Practical rules until this is fixed upstream
-1. **Do not loop `rmmod`/`modprobe` on this stack.** Treat each reload as risky.
-2. **Always unbind the odl services and let the link go DISCONNECTED before unloading**, so
-   paths are torn down while the Thunderbolt core is still present:
-   ```bash
-   for s in $(ls /sys/bus/thunderbolt/drivers/odl_tb5/ | grep -E '^[01]-'); do
-       echo $s | sudo tee /sys/bus/thunderbolt/drivers/odl_tb5/unbind >/dev/null; done
-   sleep 2 && sudo rmmod odl_tb5      # only then
-   ```
-3. **Prefer a clean reboot over a stack reload** when the link is already unhealthy — the
-   reload is only safe from a *good* state, which is precisely when you do not need it.
-4. If a boot shows `PSP firmware loading failed` / `amdgpu probe failed -22`, the machine
-   needs a **full power cycle** (not a warm reboot) to reset the firmware domain.
-
-### Correction to BUG 1's "no-reboot workaround"
-The workaround does free leaked hop-IDs and *does* work from a healthy state, but repeating
-it is what produced the wedge above. It should be used **once**, not as a routine recovery
-step. The real fix is the BUG 1 patch (release paths on every teardown path) plus ordering
-ring teardown against in-flight DMA.
-
-### Escalation: `rmmod odl_tb5` is unsafe *even with* unbind-first ordering
-
-A later attempt used the "safe" sequence (unbind all services, sleep, then `rmmod odl_tb5`
-only, leaving the Thunderbolt core loaded). **It still crashed the machine.** Kernel log from
-the crashed boot:
-
-```
-RIP: 0010:check_config_address+0x8d/0xb0 [thunderbolt]
-RIP: 0010:tb_cfg_read+0xa5/0xf0 [thunderbolt]
-RIP: 0010:drm_buddy_fini+0x119/0x120 [drm_buddy]
-RIP: 0010:notifier_chain_register+0x45/0xe0
-```
-
-i.e. after the module went away the Thunderbolt core oopsed doing ordinary config-space
-reads against a router the NHI had wedged, and `amdgpu`'s buddy allocator went down with it
-(shared firmware/power domain on Strix Halo). Result: panic and reboot, repeatedly.
-
-**Operational rule — do not unload this module.**
-- Load `odl_tb5` **exactly once per boot**. Never `rmmod` it, with or without unbinding.
-- To test a new driver build: **reboot first**, then `insmod` the new `.ko`. A reboot is
-  cheap; a wedged USB4 router plus a dead GPU is not.
-- Unbinding an individual *service* (`.../drivers/odl_tb5/unbind`) is fine and is still
-  required for BUG 2 — it is module removal that is dangerous.
-
-This supersedes the "safe unload ordering" suggested above and makes the BUG 1 patch more
-important, not less: if hop-IDs never leak, you never need to reload in the first place.
-
-### Also: BUG 1's first patch was incomplete — `complete_connection()` re-entry leaks
-
-Tracking `in_hopid`/`in_hopid_valid` and releasing on every teardown path was **not
-sufficient**. `odl_tb5_complete_connection()` calls `tb_xdomain_alloc_in_hopid()`
-unconditionally at its head and then overwrites `dev->in_hopid`. Because the function is
-re-entered on **every handshake restart** (peer restart, DMA-verify failure), each retry
-orphans the previously allocated hop-ID. With a fresh boot and the first patch applied, a
-node still reached `enable_paths failed (-12)` after a handful of restarts.
-
-Additional fix — release before re-allocating:
-
-```c
-static int odl_tb5_complete_connection(struct odl_tb5_device *dev)
-{
-        if (dev->in_hopid_valid) {          /* re-entry: drop the old one first */
-                if (dev->tx.started)
-                        tb_xdomain_disable_paths(dev->xd, dev->local_tx_hopid,
-                                                 dev->tx.ring ? dev->tx.ring->hop : -1,
-                                                 dev->in_hopid,
-                                                 dev->rx.ring ? dev->rx.ring->hop : -1);
-                tb_xdomain_release_in_hopid(dev->xd, dev->in_hopid);
-                dev->in_hopid_valid = false;
-        }
-        ret = tb_xdomain_alloc_in_hopid(dev->xd, dev->remote_tx_hopid);
-        ...
-}
-```
-
----
-
-# BUG 9 — RESOLVED: IOMMU fault was a local use-after-free, not an upstream defect
-
-**Severity: unresolved. Treat the driver as unsafe on AMD Strix Halo, but do _not_ read this
-as a confirmed upstream defect — the earlier version of this section made that claim and it
-was not supported by the evidence.**
-
-### What was actually observed
-```
-thunderbolt 0000:c7:00.6: AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x003f
-                                                address=0xffbb8000 flags=0x0020]
-amdgpu 0000:c5:00.0: probe with driver amdgpu failed with error -22
-amdgpu_irq_put+0xc4/0xe0 [amdgpu]        (repeated)
-drm_buddy_fini+0x112/0x120 [drm_buddy]
-BUG: kernel NULL pointer dereference, address: 0000000000000000
-```
-The `IO_PAGE_FAULT` on the Thunderbolt controller comes first; the USB4 router then wedges,
-and because the router shares a firmware/power domain with the iGPU on Strix Halo, `amdgpu`
-fails to initialise — sometimes on the *following* boot too, needing a full power cycle.
-That sequence is real and was seen repeatedly.
-
-### Why the previous root cause was withdrawn
-This section previously asserted the driver hands the NHI unmapped addresses and that the
-ring buffers "must be mapped through the Thunderbolt device's DMA API". **That is wrong.**
-Direct inspection of `odl_tb5_rings_alloc()` shows the buffers are already allocated with
-
-```c
-dma_alloc_coherent(tb_ring_dma_device(dev->tx.ring), ...)
-```
-
-i.e. the correct API against the correct device. The stated defect does not exist.
-
-### The confound
-The crashes used to justify this bug were produced by a **locally patched build, not stock
-upstream.** While adding the BUG 1 hop-ID fix, a bad patch to `odl_tb5_remove()` silently
-deleted its entire cleanup body — `odl_tb5_rings_stop()`, six `cancel_work_sync()` calls,
-`synchronize_rcu()`, `list_del_rcu()`, and the buffer/ring frees — leaving:
-
-```
-  ... state bookkeeping ... -> disable_paths/release_in_hopid -> kfree(dev)
-```
-
-So `dev` and its coherent ring buffers were freed **while the NHI rings were still armed and
-work items still held pointers to them.** DMA into freed-and-reallocated memory is an exact
-mechanism for `IO_PAGE_FAULT` at a stale address, and for the wedge that follows. That build
-was loaded during the crash runs quoted above, so those runs **cannot distinguish** an
-upstream DMA defect from this local use-after-free.
-
-`odl_tb5_remove()` has since been restored to the upstream teardown order, with the BUG 1 fix
-re-applied *after* `rings_stop()`/`bufs_free()` rather than in place of them:
+The correct order — apply any hop-ID fix **after** the rings are stopped:
 
 ```
 send_logout -> cancel_work_sync x6 -> rings_stop -> synchronize_rcu -> list_del_rcu
    -> dma_bufs_free -> rings_free -> disable_paths -> release_in_hopid -> kfree
 ```
 
-### What is still true regardless
-These were reproduced against **stock** code and are unaffected by the retraction:
-- `rmmod` / service `unbind` leave rings armed and can wedge the router (BUG 1 teardown path).
-- Repeated whole-TB-stack reloads wedge the USB4 controller and the GPU PSP.
-- An unbounded login-retry loop hammers a wedged router (fixed by `login_max_retries`).
-
-### Status — RESOLVED
-**Retested and clear.** With the restored teardown, 3/3 `rmmod`+`insmod` cycles on node 1:
-no `IO_PAGE_FAULT`, no oops, no `enable_paths -12`, GPU healthy, no reboot required. The
-`rmmod is unsafe` claim in earlier revisions was itself a symptom of this regression and is
-withdrawn. Superseded text follows for the record.
-
-**(historical)** The corrected driver has not been run long enough to say whether the
-IOMMU fault recurs. Until it has:
-- keep treating a load of `odl_tb5` on a machine you care about as risky;
-- do not cite this section as evidence of an upstream bug;
-- if you reproduce `IO_PAGE_FAULT` on a **clean upstream checkout** with no local patches,
-  that would be a genuine finding worth reporting — this one was not.
+Full retraction, the original claim, and the hazards that survive it are in
+[APPENDIX-HISTORY.md](APPENDIX-HISTORY.md). **Lesson worth keeping:** when a kernel
+module starts corrupting DMA after you patched it, suspect your patch before you
+suspect the platform.
 
 ---
 
-# BUG 10 — DMA verify handshake is an unwinnable race; second node always fails
+# BUG 10 — DMA verify handshake is an unwinnable race (FIXED)
 
-**Severity: blocker.** This is why two nodes never both reached READY, and it is a real
-upstream bug (not a local regression — unlike BUG 9).
+**Severity: blocker.** This is why two nodes never both reached READY, and unlike
+BUG 9 it is a real upstream bug.
 
-### Symptom
-One node reaches READY instantly. The other spins for ~31 s and dies with:
+One node reaches READY instantly. The other spins ~31 s and dies:
+
 ```
 OdinLink: DMA ping attempt 300, still waiting for pong
 OdinLink: DMA verify failed after 300 attempts
 ```
-The link is *perfectly healthy* — the failing node has already received and answered the
-peer's PING. It just never gets one back.
 
-### Root cause
-`odl_tb5_verify_work_fn()` succeeds on the first node, which then immediately does:
+The link is *perfectly healthy* — the failing node has already received and answered
+the peer's PING. It just never gets one back.
+
+`odl_tb5_verify_work_fn()` succeeds on the first node, which then does:
+
 ```c
-pr_info("OdinLink: DMA path verified, resetting rings for userspace\n");
-flush_work(&dev->ctrl_reply_work);
-hrtimer_cancel(&dev->rx_poll_timer);
 odl_tb5_rings_reset(dev);          /* drops every posted RX frame */
 dev->state = ODL_TB5_STATE_READY;
 dev->rx_target = 0;
 atomic_set(&dev->rx_posted, 0);    /* and posts NO new ones */
 ```
-The comment above it is explicit that pool RX repost does not restart until userspace issues
-a `STREAM_OPEN` ioctl. So from the moment the first node goes READY it has **zero RX frames
-posted** and silently drops everything the peer sends. The second node's PINGs land nowhere,
-its PONG never comes, and it fails — 100 % of the time, because the winner always resets
-before the loser's verify loop can complete.
 
-Measured asymmetry that identified it: winner received **0** frames after READY while the
-loser sent **300**; before the winner flipped, delivery was 300/300. The direction that
-"died" always followed whichever node reached READY first.
+Pool RX repost does not restart until userspace issues a `STREAM_OPEN` ioctl. So from
+the moment the first node goes READY it has **zero RX frames posted** and silently
+drops everything the peer sends — 100 % of the time, because the winner always resets
+before the loser's verify loop completes. Measured asymmetry that identified it: the
+winner received **0** frames after READY while the loser sent **300**; before the flip,
+delivery was 300/300.
 
-### Fix (applied)
-A node that *answers* a PING has already proven the path in both directions: it received a
-frame (RX works) and successfully submitted one (TX works). It must not wait for a PONG that
-by construction will never arrive.
+**Fix.** A node that *answers* a PING has already proven the path both ways — it
+received a frame and successfully submitted one. It must not wait for a PONG that by
+construction will never arrive:
 
 ```c
-	if (type == ODL_TB5_DMA_PING) {
-		int ret;
-
-		pr_info("OdinLink: DMA ping received, sending pong\n");
-		ret = odl_tb5_send_dma_msg(dev, ODL_TB5_DMA_PONG);
-
-		/* Answering a PING proves RX and TX both work. */
-		if (!ret && !dev->pong_received) {
-			dev->pong_received = true;
-			wake_up_all(&dev->verify_waitq);
-		}
-	} else {
+if (type == ODL_TB5_DMA_PING) {
+        ret = odl_tb5_send_dma_msg(dev, ODL_TB5_DMA_PONG);
+        /* Answering a PING proves RX and TX both work. */
+        if (!ret && !dev->pong_received) {
+                dev->pong_received = true;
+                wake_up_all(&dev->verify_waitq);
+        }
+}
 ```
 
-### Result
-Both nodes reach READY in **~0.4 ms**, first attempt, no retries:
-```
-node2: DMA ping received, sending pong
-node2: DMA path verified, resetting rings for userspace
-node2: entering READY state
-```
-End-to-end CLI over the verified link: **median 22.92 µs**, p95 34.31 µs, jitter 5.53 µs,
-1000/1000 iterations, "All tests completed successfully".
+Both nodes now reach READY in **~0.4 ms**, first attempt. See BUG 18 for the
+regression this fix introduced and how it was closed.
 
-### Note for upstream
-An alternative fix is to keep a small number of RX frames posted in READY state so ctrl
-frames remain serviceable. That is arguably cleaner but changes buffer accounting that the
-legacy daemon/CLI consumers depend on; the fix above is minimal and touches only the
-handshake.
+*Alternative for upstream:* keep a few RX frames posted in READY so ctrl frames stay
+serviceable. Cleaner, but it changes buffer accounting the legacy daemon/CLI depend on.
+
+---
+
+# BUG 11 — no discovery path; OdinLink is invisible to every RDMA app (FIXED)
+
+**Severity: blocker for any real use.** Two independent defects.
+
+**1. Stale ABI symbol.** `verbs/src/odl_tb5_provider_plugin.c` resolves
+`verbs_register_driver_34`. rdma-core 61 (Ubuntu 26.04) exports only
+`verbs_register_driver_59@@IBVERBS_PRIVATE_59`. The `dlsym` returns NULL, the
+constructor warns to stderr where nobody sees it, and the provider silently never
+registers. The build also emits `libodl_tb5-rdmav34.so` while every system provider
+is `-rdmav59`, so rdma-core's directory scan skips it regardless.
+
+**2. No kernel RDMA device.** rdma-core enumerates from `/sys/class/infiniband/*` +
+`/dev/infiniband/uverbsN`. OdinLink's module creates only a char device
+(`/dev/odl_tb5_0`) and registers nothing with `ib_core`, so `ibv_devices` stays empty
+and `match_device`/`alloc_device` are never called.
+
+Every consumer — llama.cpp's `ggml-rpc` RDMA transport, RCCL's IB transport, every
+`perftest` tool — starts with `ibv_get_device_list()` → `ibv_get_device_name()` →
+`ibv_open_device()` → `ibv_query_port()` → `ibv_query_gid_ex()` to match a GID
+against the local IP. None of that could resolve.
+
+**Fix here:** supply the discovery half of the API in the existing LD_PRELOAD shim —
+new file `verbs/src/odl_tb5_verbs_discovery.c`:
+
+- `ibv_get_device_list` / `ibv_free_device_list` / `ibv_get_device_name` — advertise
+  `odl_tb5_N` **alongside** (not instead of) real adapters, which are forwarded to the
+  real libibverbs so a Mellanox card in the same box keeps working.
+- `ibv_query_gid` **and** `_ibv_query_gid_ex` — synthesise a RoCE v2 GID as the
+  IPv4-mapped local address (`::ffff:a.b.c.d`, from `ODL_RDMA_GID_IFACE`, default
+  `bond0`). Both forms must be interposed: `ibv_query_gid_ex` is `static inline` and
+  forwards to the exported `_ibv_query_gid_ex`, while plain `ibv_query_gid` is called
+  separately by `rdma_probe()` — and the real libibverbs implementation **segfaults**
+  on an OdinLink context, since it walks provider-private state that does not exist.
+
+The data-path verbs (`ibv_post_send`, `ibv_poll_cq`) are `static inline` and dispatch
+through `context->ops`, which `odl_init_context_ops()` already fills — no interposer
+needed.
+
+`ibv_devices` now lists `odl_tb5_0` on both nodes. **This is a bridge, not a complete
+integration:** the proper fix is `ib_register_device()` in the kernel module, and until
+that exists every consumer needs the `LD_PRELOAD`.
+
+---
+
+# BUG 12 — RCCL world-communicator rendezvous deadlock (OPEN)
+
+This one is in **this repo's llama.cpp port**, not in OdinLink.
+
+`ggml_cuda_world_init_once()` blocks in `accept()` on rank 0 during the local
+backend's allreduce, while the RPC peer only calls the same function when it
+*executes* an allreduce node. With `test-world-allreduce` the head reaches
+`world run: layers=60 iters=30`, prints `rank 0 waiting for 1 peer(s) on port 29500`,
+and hangs; the peer accepts the RPC connection, never executes the allreduce, never
+connects back. Observed: head has 0 established connections to the peer while blocked,
+peer GPU at 0 %.
+
+`docs/REPRODUCE.md` flags this as an intermittent startup hang; on the 27B here it
+reproduces every time. **This is why the RDMA `-sm tensor` numbers do not exist yet** —
+the configuration RDMA would help most is the one that cannot start.
+
+---
+
+# BUG 13 — `ibv_post_recv` had inverted semantics (FIXED)
+
+`odl_post_recv()` did not post a buffer; it **performed a receive inline**, blocking
+in `poll(fd, 5000)`:
+
+```c
+int pr = poll(&pfd, 1, 5000);
+if (pr <= 0 || !(pfd.revents & POLLIN)) { *bad_wr = wr; return pr == 0 ? -ETIMEDOUT : -EAGAIN; }
+```
+
+Every verbs consumer **pre-posts** receive buffers before any traffic exists —
+llama.cpp posts `RDMA_RX_DEPTH` (24) between the INIT and RTR transitions, and
+RCCL/perftest do the same. So the first post always failed and setup aborted with
+`RDMA activate failed, staying on TCP`. A design-level incompatibility, not a tuning
+issue.
+
+**Fix:** a real receive queue. `post_recv` copies the WR into a ring and returns
+immediately; a worker drains inbound stream data into posted buffers and posts the
+completions (`odl_rq_drain()`).
+
+---
+
+# BUG 14 — send path stored pointers to caller stack memory (FIXED)
+
+`odl_post_send()` stored the caller's `struct ibv_send_wr *` in `qp->sq[]` and the
+worker dereferenced it later. Callers legitimately use stack storage, because
+`ibv_post_send` is defined to consume the WR before returning:
+
+```c
+struct ibv_sge sge = {};
+struct ibv_send_wr wr = {}, *bad = nullptr;
+if (ibv_post_send(c->qp, &wr, &bad) != 0) return false;   // wr dies at scope exit
+```
+
+The worker was reading freed stack frames.
+
+**Fix:** copy `wr_id`/`addr`/`length`/`lkey`/`num_sge` at post time. The same change
+sets `wc.wr_id` on send completions, which was never populated — consumers that match
+completions by `wr_id` (llama.cpp uses the chunk sequence number) could not have worked.
+
+---
+
+# BUG 15 — `modify_qp` discarded `IBV_QP_DEST_QPN` (FIXED)
+
+The RTR transition dropped the destination QP number, so every send was addressed to
+`dst_id 0` and landed nowhere. Fixed by honouring the attribute and plumbing it to the
+stream's destination ID.
+
+---
+
+# BUG 16 — `cmd_fd` clobbered immediately after being set (FIXED)
+
+`odl_ibv_open_device()` set up the device fd; the "Initialize context fields" block
+four lines later overwrote it:
+
+```c
+    ctx->base.cmd_fd = dev_fd;     /* fd stored */
+}
+/* Initialize context fields */
+ctx->base.cmd_fd        = -1;      /* ...and immediately thrown away */
+```
+
+`odl_worker_poll_fd()` therefore always returned `-EBADF`, the worker never waited for
+TX readiness, and it busy-spun on `send EAGAIN, re-queueing` at ~1000 log lines/second.
+**Fix:** assign the fd *after* the defaults.
+
+---
+
+# BUG 17 — `poll()` POLLOUT was a chicken-and-egg (FIXED)
+
+```c
+/* Writable if TX has room */
+if (atomic_read(&dev->tx.completed) > 0)
+    mask |= EPOLLOUT | EPOLLWRNORM;
+```
+
+TX counted as writable only once a previous TX had *completed* — never true before the
+first send. Every non-blocking sender burned the full 5 s poll timeout per message,
+visible in the driver log as TX submissions exactly 5 s apart:
+
+```
+[11909.495468] TX submit stream=20 dst=20 len=1
+[11914.501045] TX submit stream=20 dst=20 len=8     <- +5.0 s
+```
+
+**Fix:** POLLOUT must mean "a send would succeed now" — the same condition
+`odl_tb5_stream_can_send()` applies. After the fix the same trace shows microsecond
+spacing (`+10 µs`, `+4 µs`).
+
+---
+
+# BUG 18 — verify clears the proof a peer PING already provided (FIXED)
+
+A regression introduced by this repo's own BUG 10 fix.
+`odl_tb5_ctrl_reply_work_fn()` sets `pong_received = true` when it answers a peer PING,
+but if that PING arrives *before* the local `odl_tb5_verify_work_fn()` starts — the
+common case when the peer loaded first — verify's first statement wipes it:
+
+```c
+dev->pong_received = false;   /* discards the proof we already had */
+```
+
+Verify then times out, the device stays `CONNECTED` (state 2) instead of reaching
+`READY` (state 4), and since `odl_tb5_stream_can_send()` requires READY, **every send
+returns `-EAGAIN` forever**:
+
+```
+odl_tb5: can_send=0 state=2 free=1024 reserve=64 rx_target=512 rx_posted=0
+```
+
+Note `free=1024` — the frame pool was completely idle; state was the only failing term.
+
+**Fix:** a separate `peer_ping_answered` flag that verify does not clear (reset only
+when a new connection begins), honoured by the wait condition and the final check.
+
+---
+
+# BUG 19 — `ibv_poll_cq` deadlocked against its own completion producer (FIXED)
+
+```c
+/* Clear eventfd if we drained the ring */
+if (ocq->head == ocq->tail) {
+    eventfd_t val;
+    eventfd_read(ocq->eventfd_fd, &val);
+}
+pthread_mutex_unlock(&ocq->lock);
+```
+
+`ibv_poll_cq()` is defined to be non-blocking — consumers busy-poll it. This
+implementation blocked in `eventfd_read()` on an empty CQ **while holding `ocq->lock`**,
+and `odl_cq_post()` needs that same lock to deliver a completion. The only thread that
+could wake the poller was locked out of doing so:
+
+```
+odl_poll_cq -> eventfd_read (blocked)
+  <- rdma_poll <- rdma_recv <- send_rpc_cmd <- ggml_backend_rpc_get_device_memory
+```
+
+**Fix:** drain the eventfd outside the lock, only when completions were actually
+consumed, and force `O_NONBLOCK` at CQ creation rather than trusting the flag. The
+empty-CQ path must do **no** syscalls at all — an `fcntl` + `eventfd_read` per poll
+iteration dominates the transfer and is itself a (softer) failure mode.
+
+---
+
+# BUG 20 — full-size frames silently dropped (FIXED — the bulk blocker)
+
+```c
+#define ODL_TB5_STREAM_PAYLOAD_MAX   (ODL_TB5_FRAME_SIZE - ODL_TB5_STREAM_HDR_SIZE)
+```
+
+A maximally-filled frame is therefore **exactly** `ODL_TB5_FRAME_SIZE` (4096) bytes.
+The RX ring buffers are the same 4096 bytes, and a Thunderbolt ring frame carries
+framing/CRC overhead beyond the payload the driver writes — so full frames do not fit
+and the NHI drops them **silently**, with no error at any layer.
+
+Only sub-maximal frames were ever delivered. That is why the link looked perfectly
+healthy: the RPC handshake's 1–16 byte messages are single frames and worked, both
+peers reached `RDMA activated`, and `ibv_devinfo` was happy. But every *multi-frame*
+message lost all of its full fragments and kept only the short tail, so reassembly
+never completed and the receiver waited forever.
+
+Captured directly — an 8496-byte message sends as `4091 + 4091 + 314`, and the peer
+logs only the tail:
+
+```
+odl_tb5: RXF-BIG dst=20 src=20 plen=314 flags=0x02 stream=yes    <- nothing else
+```
+
+**Fix:** reserve `ODL_TB5_FRAME_TAIL_RESERVE` (64 B) so header + payload stays strictly
+below the buffer size, applied to **both** the driver uapi and the userspace ioctl
+header so fragmentation matches on each side. Both nodes must run the same build.
+
+---
+
+# BUG 21 — send completed before the payload reached the wire (FIXED)
+
+The first byte-verifying stress run exposed a bug every `llama-bench` run had hidden:
+
+```
+client: PASS: 1024 msgs, 256.0 MiB in 0.26s = 979.2 MiB/s
+server: CORRUPTION at msg 0, first bad word 0 (byte 0 of 262144)
+```
+
+`ibv_post_send()` must consume the payload before returning — callers reuse the buffer
+immediately. `odl_tb5_stream_send()` only queued it, so the worker DMA'd whatever the
+caller had since written, and the completion fired before the bytes reached the wire
+(hence the impossible 979 MiB/s).
+
+**Fix:** bounce-copy the payload at post time.
+
+**This invalidated an earlier "2B model works" result.** `llama-bench` measures speed,
+not output correctness, so a corrupting transport still prints a plausible t/s — and
+did. After the fix, 256 MiB verifies clean at 7.7 Gb/s.
+
+---
+
+# BUG 22 — no fragment sequencing in the wire header (FIXED)
+
+At 27B scale the transport survived **18.5 GiB** and then failed:
+
+```
+recv+verified 73728/86016 (18432.0 MiB)          <- 18.5 GiB byte-perfect
+SHORT msg 73956: got 44686 bytes, expected 262144
+CORRUPTION at msg 73956, first bad word 1006 (byte 8048 of 44686)
+```
+
+Byte 8048 is almost exactly two payload fragments (2 × 4027), so the first two arrive
+correct and reassembly then desyncs — a dropped fragment. The root cause is the wire
+format:
+
+```c
+struct odl_tb5_stream_hdr {
+    __u8 src_id; __u8 dst_id; __u8 flags; __le16 payload_len;
+} __packed;                      /* flags: MSG_START | MSG_END only */
+```
+
+A multi-frame message is reassembled by **blind concatenation** gated only by
+START/END. No fragment index, no offset, no message length, no checksum — so if any
+fragment is lost the receiver cannot tell. It concatenates fewer bytes and delivers a
+short, silently corrupt message at MSG_END.
+
+**Fix:** a fragment index in the stream header (grown to 8 bytes), contiguity checked
+at reassembly, and a gap reported as an error with the damaged message dropped. This
+**detects** loss; it does not retransmit. A 20.88 GiB model transfer needs ~86 000
+messages and ~5.5 million fragments, so undetected loss was a coin flip before this.
+
+Remaining work, in order: (1) attribute the drop source — 18.5 GiB clean implies a
+rare condition (RX repost starvation, frame-pool exhaustion, NHI ring wrap), not a
+systematic bug; (2) then consider NAK/retry, which sequencing now makes possible.
+
+---
+
+# BUG 23 — bidirectional traffic deadlocks (FIXED — the 27B blocker)
+
+Unidirectional bulk ran 21 GiB flawlessly while llama.cpp still died on the 27B. The
+distinguishing property: ggml-rpc is **request/response on one QP**, so both peers send
+and receive concurrently. `odl_rdma_stress --bidir` reproduces it in ~25 s and found
+three separate causes.
+
+1. **ABBA lock inversion.** Draining the receive queue from `ibv_poll_cq()` meant two
+   threads polling *different* CQs both entered `odl_rq_drain`, which posts completions
+   into the *other* CQ — opposite lock orders. Receive progress now belongs to a
+   **dedicated per-QP RX thread**, independent of who polls what. TX and RX are separate
+   engines, as on real hardware.
+
+2. **One stream served both directions.** The RCCL plugin — the only consumer known to
+   work — opens a *separate* stream per direction and never shares one. Each QP now
+   opens two: `rx_stream` (advertised as `qp_num`, so the peer's `IBV_QP_DEST_QPN` names
+   where we receive) and `tx_stream`.
+
+3. **Reserve sized as if it were the RX ring.** `TX_POOL_RESERVE=2048` against
+   `rx_target=2048` of a 4096-frame pool left `free_count == reserve` exactly, and
+   `can_send()` tests `free > reserve` — TX blocked forever on a healthy link. The
+   driver diagnostic printed it verbatim: `can_send=0 state=4 free=2048 reserve=2048`.
+   The reserve is a *floor* for RX repost, not the ring size; 256 leaves TX ~1700 frames.
+
+Teardown was fixed alongside: `destroy_qp` now joins the RX thread (it kept draining
+into a freed QP) and frees bounce buffers for untransmitted WRs.
+
+**Method note.** Three of the changes made while chasing this were hypothesis-driven and
+two made things *worse* — the oversized reserve deadlocked TX outright, and draining from
+`poll_cq` introduced the ABBA. Reliable progress came from two things only: a test that
+reproduces the real access pattern in seconds and verifies every byte, and a driver
+diagnostic that prints the failing arithmetic. Build those first.
+
+---
+
+# Operational notes — Thunderbolt bond recovery
+
+Reloading the Thunderbolt stack disturbs the **IP bond** that shares the same cables.
+
+1. **Stale ARP after a `thunderbolt_net` reload.** New interfaces get new MACs; the
+   peer's ARP entry goes stale and traffic blackholes in one direction only.
+   `sudo ip neigh flush dev bond0`.
+2. **A slave can come back "up" but carry no traffic.** `carrier=1`, `operstate=up`, yet
+   one link receives nothing. With `balance-rr` the bond keeps striping onto the dead
+   slave — ~50–66 % loss while ping *partially* works, easy to misread as "peer is down".
+   Find it with per-interface `rx_packets` during a ping, then
+   `sudo ip link set thunderbolt1 down`.
+3. **Keep a non-Thunderbolt path to every node.** None of the above is debuggable
+   otherwise.
+4. **`odl_tb5` and `thunderbolt_net` coexist** (`prtcid=20300` vs `1`), so RDMA and IP
+   share the cables — but a stack reload resets both.
+5. **`odl_tb5` and `thunderbolt_ibverbs` do *not* coexist** — both drive the same NHI DMA.
+6. **Never probe the RPC port with `/dev/tcp`.** `ggml-rpc-server` rejects the non-HELLO
+   bytes and *exits*; if it is the container's PID 1 the container dies with it.
+
+## Still cautionary
+
+Each of these predates the BUG 9 regression and is **not** retracted, though each
+deserves re-testing against the repaired build:
+
+| ⚠️ | why |
+|---|---|
+| Reloading the **whole Thunderbolt stack** (unbinding the `thunderbolt` PCI driver, not just `odl_tb5`) | Wedged the USB4 controller and the GPU PSP; recovery needed a full power cycle. A different operation from `rmmod odl_tb5`, and never disproven |
+| Unbounded login retries against a wedged router | Fixed by `login_max_retries` (default 20) |
+| A boot logging `PSP firmware loading failed` | Power off fully; a warm reboot will not clear it |
+
+## Also worth knowing
+
+- **A corrupt `~/.cache/comgr` bricks HIP entirely.** One node segfaulted inside
+  `libamdhip64` on *every* HIP program, including a 20-line `hipMalloc` test.
+  `AMD_LOG_LEVEL=4` gave the real cause:
+  ```
+  ld.lld: error: undefined hidden symbol: __ockl_dm_init_v1
+  rocdevice.cpp:730 : Couldn't create blit kernels!
+  ```
+  HIP JIT-links its blit kernels at init; a poisoned cache makes that link fail and the
+  runtime dereferences NULL. Every on-disk file was byte-identical to the working node.
+  Fix: `rm -rf ~/.cache/comgr` — try it **before** reinstalling ROCm. This cost a full
+  ROCm reinstall to find.
+- **AMD's apt repo needs pin priority 600** (`/etc/apt/preferences.d/repo-radeon-pin-600`),
+  or Ubuntu's own `rocminfo`/`rocm-smi` win and block `rocm` with unsatisfiable conflicts.
+- The driver logs under **two** prefixes: `odl_tb5:` (load/probe) and `OdinLink:`
+  (handshake/DMA). Grepping only the first hides every interesting failure.
+- `/dev/odl_tb5_N` indices are assigned by probe order and **differ between nodes** —
+  read them, don't assume 0.
+- Start the RPC server or CLI server over ssh with `exec` in a held session;
+  `setsid … &` gets orphaned and dies silently.

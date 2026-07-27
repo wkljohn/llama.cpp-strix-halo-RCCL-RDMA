@@ -123,6 +123,22 @@ Verified working output on this rig is the first block. If you see
 That silent fallback is the easiest way to "measure RDMA" and actually measure
 TCP. Always check.
 
+## How far this actually gets — read before quoting any number
+
+**Plugin binding is verified. A tensor-parallel benchmark over it is not.**
+
+RCCL selects `ODL_TB5` instead of sockets — the log block above is real output from this
+rig. What has *not* been done is a completed `-sm tensor` run over that link: the
+llama.cpp port's world-communicator rendezvous deadlocks
+([FINDINGS.md](FINDINGS.md) BUG 12), so the collective never starts.
+
+Everything in [RESULTS.md](RESULTS.md) with a t/s figure is `-sm layer` (pipeline) over
+the RPC transport, not RCCL tensor parallel. The TP numbers in the repo root are TCP-era.
+
+This is the honest state of the most interesting case: TP all-reduces every layer, so it
+is the configuration a 13× latency improvement should transform — and it is the one that
+cannot yet be measured.
+
 ## Notes / known limits
 
 - `odl_tb5` and `thunderbolt_ibverbs` cannot coexist — both drive the same NHI.
