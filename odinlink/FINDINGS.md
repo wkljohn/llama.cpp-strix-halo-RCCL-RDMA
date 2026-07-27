@@ -616,3 +616,56 @@ static int odl_tb5_complete_connection(struct odl_tb5_device *dev)
         ...
 }
 ```
+
+---
+
+# BUG 9 — NHI ring DMA is not IOMMU-mapped → USB4 wedge → GPU death (STOPPER)
+
+**Severity: critical / do-not-run.** This is the finding that ended testing.
+
+### Evidence (reproduced ~6 times across two machines)
+```
+thunderbolt 0000:c7:00.6: AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x003f
+                                                address=0xffbb8000 flags=0x0020]
+amdgpu 0000:c5:00.0: probe with driver amdgpu failed with error -22
+amdgpu_irq_put+0xc4/0xe0 [amdgpu]        (repeated)
+drm_buddy_fini+0x112/0x120 [drm_buddy]
+BUG: kernel NULL pointer dereference, address: 0000000000000000
+RIP: 0010:0x0
+```
+
+### Order of events
+1. **`AMD-Vi: IO_PAGE_FAULT` on the Thunderbolt controller** — the NHI DMA engine issues a
+   transaction to an address the AMD IOMMU has no mapping for. This is *first*; everything
+   else follows from it.
+2. The USB4 host router wedges. Subsequent `tb_cfg_read()` / `check_config_address()` from the
+   Thunderbolt core oops.
+3. On Strix Halo the USB4 router and the iGPU share a firmware/power domain, so the GPU's PSP
+   fails (`PSP firmware loading failed`), `amdgpu` probe returns **-22**, and its failure
+   cleanup path (`amdgpu_irq_put`, `drm_buddy_fini`) dereferences NULL.
+4. Hard freeze. A warm reboot often does **not** clear it — the next boot can come up with no
+   GPU at all. Full power cycle required.
+
+### What this is not
+It is **not** caused by the operations we previously blamed. It reproduced with all of these
+already avoided:
+- no `rmmod odl_tb5`
+- no service `unbind`
+- `login_max_retries` bounded (no retry storm)
+- `max_devices=1` (single service, no route collision)
+
+The trigger is the driver's own DMA ping/pong during link verification.
+
+### Suggested direction for upstream
+The ring buffers must be mapped for device DMA through the Thunderbolt device's DMA API
+(`dma_map_single`/`dma_alloc_coherent` against `&nhi->pdev->dev`, or the `tb_ring` owner),
+not merely allocated and handed to the NHI by virtual/physical address. On Intel platforms an
+identity/passthrough IOMMU domain often hides this; AMD-Vi enforces it, so the fault only
+appears on AMD hosts. Worth validating with `CONFIG_IOMMU_DEBUG`, and comparing behaviour
+with `iommu=pt` versus a translating domain.
+
+### Practical consequence
+**RDMA-over-Thunderbolt via OdinLink is not currently usable on AMD Strix Halo.** The
+measured 22.4 µs latency (see top) is genuine — the transport really is ~13× faster than TCP
+— but the link cannot be kept up long enough to carry a real workload without risking the
+machine.
