@@ -1576,10 +1576,10 @@ index 841dfac..720153a 100644
 +extern rcclNet_v7_t ncclNetPlugin_v7 __attribute__((alias("rcclNetPlugin_v7")));
 diff --git a/tests/odl_rdma_stress.c b/tests/odl_rdma_stress.c
 new file mode 100644
-index 0000000..8932033
+index 0000000..2e7973f
 --- /dev/null
 +++ b/tests/odl_rdma_stress.c
-@@ -0,0 +1,525 @@
+@@ -0,0 +1,628 @@
 +/*
 + * OdinLink — RDMA bulk-transfer stress / conformance test
 + *
@@ -1621,6 +1621,7 @@ index 0000000..8932033
 +#include <netinet/in.h>
 +#include <netinet/tcp.h>
 +#include <sys/socket.h>
++#include <math.h>
 +#include <infiniband/verbs.h>
 +#include <pthread.h>
 +
@@ -1636,6 +1637,7 @@ index 0000000..8932033
 +static int      opt_gid_idx  = -1;
 +static bool     opt_bidir    = false;  /* both peers send AND receive */
 +static bool     opt_mixed    = false;  /* interleave small control msgs */
++static bool     opt_latency  = false;  /* ping-pong RTT through the verbs path */
 +
 +struct conn_info {
 +    uint32_t qpn;
@@ -1947,6 +1949,95 @@ index 0000000..8932033
 +    return 0;
 +}
 +
++
++/* ── verbs-path latency: ping-pong through post_send/post_recv/poll_cq ──
++ *
++ * The CLI latency tool talks straight to ioctls and never enters the verbs
++ * shim, so it cannot see changes there (inline fast path, RX worker sleep
++ * behaviour). This does, and it verifies the echoed payload so an inline-path
++ * overtake or a stale buffer fails loudly instead of quietly producing a
++ * good-looking number.
++ */
++static int cmp_double(const void *a, const void *b)
++{
++    double x = *(const double *)a, y = *(const double *)b;
++    return (x > y) - (x < y);
++}
++
++static int latency_pingpong(struct rdma_ctx *r, bool server, uint64_t iters)
++{
++    double *samples = calloc(iters, sizeof(*samples));
++    uint64_t warmup = iters / 10 ? iters / 10 : 1;
++    int rc = 0;
++
++    if (!samples) return 1;
++
++    for (uint64_t i = 0; i < iters + warmup; i++) {
++        double t0 = now_s();
++
++        if (!server) {
++            fill_chunk(r->tx_buf, opt_chunk, i);
++            struct ibv_sge sge = { .addr = (uintptr_t)r->tx_buf,
++                                   .length = opt_chunk, .lkey = r->tx_mr->lkey };
++            struct ibv_send_wr wr = {0}, *bad = NULL;
++            wr.wr_id = i; wr.opcode = IBV_WR_SEND;
++            wr.sg_list = &sge; wr.num_sge = 1;
++            wr.send_flags = IBV_SEND_SIGNALED;
++            if (ibv_post_send(r->qp, &wr, &bad)) { rc = 3; goto out; }
++
++            struct ibv_wc wc;
++            if (poll_one(r->scq, &wc, now_s() + opt_stall_s) < 0) { rc = 3; goto out; }
++            if (poll_one(r->rcq, &wc, now_s() + opt_stall_s) < 0) { rc = 3; goto out; }
++            if (verify_chunk(r->rx_buf + (size_t)wc.wr_id * opt_chunk,
++                             wc.byte_len < opt_chunk ? wc.byte_len : opt_chunk,
++                             i) >= 0) {
++                fprintf(stderr, "CORRUPTION in echo at iter %llu\n",
++                        (unsigned long long)i);
++                rc = 2; goto out;
++            }
++            if (!post_rx(r, (int)wc.wr_id)) { rc = 3; goto out; }
++        } else {
++            struct ibv_wc wc;
++            if (poll_one(r->rcq, &wc, now_s() + opt_stall_s) < 0) { rc = 3; goto out; }
++            int slot = (int)wc.wr_id;
++            memcpy(r->tx_buf, r->rx_buf + (size_t)slot * opt_chunk, opt_chunk);
++            if (!post_rx(r, slot)) { rc = 3; goto out; }
++
++            struct ibv_sge sge = { .addr = (uintptr_t)r->tx_buf,
++                                   .length = opt_chunk, .lkey = r->tx_mr->lkey };
++            struct ibv_send_wr wr = {0}, *bad = NULL;
++            wr.wr_id = i; wr.opcode = IBV_WR_SEND;
++            wr.sg_list = &sge; wr.num_sge = 1;
++            wr.send_flags = IBV_SEND_SIGNALED;
++            if (ibv_post_send(r->qp, &wr, &bad)) { rc = 3; goto out; }
++            if (poll_one(r->scq, &wc, now_s() + opt_stall_s) < 0) { rc = 3; goto out; }
++        }
++
++        if (i >= warmup)
++            samples[i - warmup] = (now_s() - t0) * 1e6;   /* us */
++    }
++
++    if (!server) {
++        qsort(samples, iters, sizeof(*samples), cmp_double);
++        double sum = 0;
++        for (uint64_t i = 0; i < iters; i++) sum += samples[i];
++        double mean = sum / iters, var = 0;
++        for (uint64_t i = 0; i < iters; i++)
++            var += (samples[i] - mean) * (samples[i] - mean);
++        printf("\n=== verbs-path RTT, %llu iters, %zu B payload ===\n",
++               (unsigned long long)iters, opt_chunk);
++        printf("  min    %8.2f us\n", samples[0]);
++        printf("  median %8.2f us\n", samples[iters / 2]);
++        printf("  p95    %8.2f us\n", samples[(uint64_t)(iters * 0.95)]);
++        printf("  p99    %8.2f us\n", samples[(uint64_t)(iters * 0.99)]);
++        printf("  max    %8.2f us\n", samples[iters - 1]);
++        printf("  mean   %8.2f us  stddev %.2f us\n", mean, sqrt(var / iters));
++    }
++out:
++    free(samples);
++    return rc;
++}
++
 +/* ── bootstrap ───────────────────────────────────────────────────────── */
 +
 +static int bootstrap(bool server, const char *peer_ip, struct conn_info *local,
@@ -2008,6 +2099,9 @@ index 0000000..8932033
 +           "                    This is what ggml-rpc actually does, and it is\n"
 +           "                    the only mode that exercises TX/RX contention\n"
 +           "                    for the shared frame pool.\n"
++           "  --latency         ping-pong RTT through the VERBS path (not\n"
++           "                    ioctls), with echo verification. Use with a\n"
++           "                    small --chunk to exercise the inline fast path.\n"
 +           "  --mixed           interleave small control messages with bulk,\n"
 +           "                    as the RPC protocol does (exercises the\n"
 +           "                    latency/throughput dispatcher and odd sizes)\n");
@@ -2041,6 +2135,7 @@ index 0000000..8932033
 +        else if (!strcmp(argv[i], "--stall") && i + 1 < argc) opt_stall_s = atoi(argv[++i]);
 +        else if (!strcmp(argv[i], "--bidir")) opt_bidir = true;
 +        else if (!strcmp(argv[i], "--mixed")) opt_mixed = true;
++        else if (!strcmp(argv[i], "--latency")) opt_latency = true;
 +        else { usage(); return 1; }
 +    }
 +    if (!server && !peer_ip) { usage(); return 1; }
@@ -2070,6 +2165,12 @@ index 0000000..8932033
 +    double t0 = now_s();
 +    int rc = 0;
 +
++    if (opt_latency) {
++        rc = latency_pingpong(&r, server, nmsg > 20000 ? 20000 : nmsg);
++        if (rc) goto done;
++        goto summary;
++    }
++
 +    if (opt_bidir) {
 +        /* Both peers send AND receive concurrently on the same QP -- the
 +         * pattern ggml-rpc actually uses, and the only one that makes TX and
@@ -2092,6 +2193,8 @@ index 0000000..8932033
 +    }
 +    if (rc) goto done;
 +
++summary:
++    if (opt_latency) { close(bfd); return 0; }
 +    {
 +        double dt = now_s() - t0;
 +        double mib = (double)nmsg * opt_chunk / 1048576.0;
@@ -2583,7 +2686,7 @@ index 0000000..19826b9
 +    return EOPNOTSUPP;
 +}
 diff --git a/verbs/src/odl_tb5_verbs_qp.c b/verbs/src/odl_tb5_verbs_qp.c
-index d45260e..bb6d50b 100644
+index d45260e..b0b2f5c 100644
 --- a/verbs/src/odl_tb5_verbs_qp.c
 +++ b/verbs/src/odl_tb5_verbs_qp.c
 @@ -18,6 +18,9 @@
@@ -2910,7 +3013,27 @@ index d45260e..bb6d50b 100644
      if (attr_mask & IBV_QP_STATE) {
          qp->state = attr->qp_state;
          odl_loginfo("modify_qp: qp_num=%u state=%d -> %d",
-@@ -314,6 +453,44 @@ int odl_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
+@@ -306,6 +445,19 @@ int odl_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
+ 
+ /* ── Post Send (async) ──────────────────────────────────────────────── */
+ 
++/* ODL_VERBS_INLINE=0 disables the inline send fast path, so its benefit can be
++ * A/B measured at a fixed payload size. Default on. */
++static bool odl_inline_enabled(void)
++{
++    static int cached = -1;
++
++    if (cached < 0) {
++        const char *e = getenv("ODL_VERBS_INLINE");
++        cached = (e && e[0] == '0') ? 0 : 1;
++    }
++    return cached != 0;
++}
++
+ int odl_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
+                    struct ibv_send_wr **bad_wr)
+ {
+@@ -314,6 +466,45 @@ int odl_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
  
      pthread_mutex_lock(&oqp->sq_lock);
  
@@ -2926,7 +3049,8 @@ index d45260e..bb6d50b 100644
 +     * promises. Only taken when the SQ is empty, so ordering cannot be
 +     * violated; on -EAGAIN we fall through to the queued path.
 +     */
-+    if (wr && !wr->next && wr->num_sge == 1 &&
++    if (odl_inline_enabled() &&
++        wr && !wr->next && wr->num_sge == 1 &&
 +        oqp->sq_count == 0 && !oqp->tx_inflight &&
 +        wr->sg_list[0].length <= ODL_VERBS_INLINE_MAX &&
 +        odl_lookup_dmabuf_pub(oqp->ctx, wr->sg_list[0].lkey) < 0) {
@@ -2955,7 +3079,7 @@ index d45260e..bb6d50b 100644
      while (wr) {
          if (oqp->sq_count >= ODL_VERBS_SQ_DEPTH) {
              *bad_wr = wr;
-@@ -322,7 +499,38 @@ int odl_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
+@@ -322,7 +513,38 @@ int odl_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
              return -ENOMEM;
          }
  
@@ -2995,7 +3119,7 @@ index d45260e..bb6d50b 100644
          oqp->sq_tail = (oqp->sq_tail + 1) % ODL_VERBS_SQ_DEPTH;
          oqp->sq_count++;
          atomic_fetch_add(&oqp->pending_sends, 1);
-@@ -340,72 +548,104 @@ int odl_post_recv(struct ibv_qp *qp, struct ibv_recv_wr *wr,
+@@ -340,72 +562,104 @@ int odl_post_recv(struct ibv_qp *qp, struct ibv_recv_wr *wr,
                     struct ibv_recv_wr **bad_wr)
  {
      struct odl_verbs_qp *oqp = odl_qp_from_ibv(qp);
@@ -3049,10 +3173,6 @@ index d45260e..bb6d50b 100644
 +        }
 +        wr = wr->next;
 +    }
-+
-+    pthread_mutex_unlock(&oqp->rq_lock);
-+    return 0;
-+}
  
 -            /* Non-blocking recv */
 -            int ret = odl_tb5_stream_recv(
@@ -3060,11 +3180,9 @@ index d45260e..bb6d50b 100644
 -                (void *)(uintptr_t)sge->addr,
 -                sge->length,
 -                &src_id, &actual);
-+/* Drain inbound stream data into posted RX buffers; post one WC per message.
-+ * Non-blocking: returns the number of completions generated. */
-+int odl_rq_drain(struct odl_verbs_qp *oqp)
-+{
-+    int completions = 0;
++    pthread_mutex_unlock(&oqp->rq_lock);
++    return 0;
++}
  
 -            if (ret == -EAGAIN) {
 -                /* No data yet despite poll saying ready — rare race.
@@ -3072,10 +3190,11 @@ index d45260e..bb6d50b 100644
 -                *bad_wr = wr;
 -                return -EAGAIN;
 -            }
-+    /* Exclusive: only one drainer at a time, so receives stay ordered.
-+     * trylock, never block -- ibv_poll_cq() must not stall behind the worker. */
-+    if (pthread_mutex_trylock(&oqp->drain_lock) != 0)
-+        return 0;
++/* Drain inbound stream data into posted RX buffers; post one WC per message.
++ * Non-blocking: returns the number of completions generated. */
++int odl_rq_drain(struct odl_verbs_qp *oqp)
++{
++    int completions = 0;
  
 -            struct ibv_wc wc;
 -            memset(&wc, 0, sizeof(wc));
@@ -3094,17 +3213,24 @@ index d45260e..bb6d50b 100644
 -                wc.byte_len = 0;
 -                odl_logerr("recv failed: stream=%u ret=%d", oqp->stream_id, ret);
 -            }
++    /* Exclusive: only one drainer at a time, so receives stay ordered.
++     * trylock, never block -- ibv_poll_cq() must not stall behind the worker. */
++    if (pthread_mutex_trylock(&oqp->drain_lock) != 0)
++        return 0;
+ 
+-            if (oqp->recv_cq)
+-                odl_cq_post(oqp->recv_cq, &wc);
 +    for (;;) {
 +        uint64_t wr_id, addr;
 +        uint32_t len;
  
--            if (oqp->recv_cq)
--                odl_cq_post(oqp->recv_cq, &wc);
+-            atomic_fetch_sub(&oqp->pending_recvs, 1);
 +        pthread_mutex_lock(&oqp->rq_lock);
 +        if (oqp->rq_count == 0) {
 +            pthread_mutex_unlock(&oqp->rq_lock);
 +            break;
-+        }
+         }
+-        wr = wr->next;
 +        wr_id = oqp->rq_wr_id[oqp->rq_head];
 +        addr  = oqp->rq_addr[oqp->rq_head];
 +        len   = oqp->rq_len[oqp->rq_head];
@@ -3126,8 +3252,7 @@ index d45260e..bb6d50b 100644
 +        }
 +        pthread_mutex_unlock(&oqp->rq_lock);
 +        atomic_fetch_sub(&oqp->pending_recvs, 1);
- 
--            atomic_fetch_sub(&oqp->pending_recvs, 1);
++
 +        struct ibv_wc wc;
 +        memset(&wc, 0, sizeof(wc));
 +        wc.wr_id  = wr_id;
@@ -3141,8 +3266,7 @@ index d45260e..bb6d50b 100644
 +            wc.status   = IBV_WC_GENERAL_ERR;
 +            wc.byte_len = 0;
 +            odl_logerr("recv failed: stream=%u ret=%d", oqp->stream_id, ret);
-         }
--        wr = wr->next;
++        }
 +        if (oqp->recv_cq)
 +            odl_cq_post(oqp->recv_cq, &wc);
 +        completions++;
@@ -3154,7 +3278,7 @@ index d45260e..bb6d50b 100644
  }
  
  /* ── Query QP ───────────────────────────────────────────────────────── */
-@@ -451,3 +691,8 @@ int odl_query_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
+@@ -451,3 +705,8 @@ int odl_query_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
  
      ODL_TRACE_EXIT_VAL(0);
  }

@@ -52,6 +52,27 @@ Across five runs in four configurations, **min and median are reproducible**
 conditions. Single-run tail comparisons are not trustworthy. Median-based
 conclusions are.
 
+### Inline send fast path — the one change that measurably helps
+
+Measured through the **verbs** path (`odl_rdma_stress --latency`, 1 KiB payload,
+20000 iterations), A/B toggled with `ODL_VERBS_INLINE=0/1` at fixed payload size:
+
+| metric | OFF | ON | delta |
+|---|---|---|---|
+| min | 15.20 | **13.27** | **−1.93 µs** |
+| median | 22.58 | 22.50 | −0.08 µs |
+| p95 | 33.97 | 33.78 | −0.19 µs |
+| p99 | 34.66 | 34.31 | −0.35 µs |
+| stddev | 12.86 | **6.22** | **−52 %** |
+
+It improves the **floor and the jitter, not the median** — which is exactly the
+expected signature. On an empty pipeline it removes a thread handoff, a
+malloc+memcpy and two `poll()` syscalls; the typical case stays dominated by the
+kworker hop it cannot touch. Default on.
+
+Note the CLI latency tool cannot measure this at all — it talks straight to
+ioctls and never enters the verbs shim.
+
 ### What does NOT reduce latency (all tested, median-based)
 
 - Fallback poll timer 10 µs → 3 µs: median moved 0.2 µs. Tail only.
