@@ -475,3 +475,32 @@ peer's corresponding call (NCCL requires returning `ncclSuccess` with `*sendComm
 `*recvComm == NULL` so it can be retried, rather than returning an error), and whether the
 5 s `odl_tb5_wait_peer()` inside `connect()` can trip when the peer process has not yet
 reached its own init.
+
+### CORRECTION — the `ncclCommInitRank` failure is BUG 1, not a plugin defect
+
+The "suspected difference from the PR's tested setup" above (connect/accept retry semantics)
+is **probably wrong**. Checking the link state immediately after a failing run showed it had
+already left READY *before* the benchmark started:
+
+```
+node2:  enable_paths failed (-12) -> failed to enable XDomain paths after 5 attempts
+node1:  DMA ping attempt 250, still waiting for pong / peer restarted
+```
+
+That is **BUG 1 (the XDomain hop-ID leak)**. The plugin opens and closes the device on every
+comm setup; each cycle restarts the link, and after enough cycles the peer exhausts hop-IDs.
+With the link not READY, `get_shared_handle()`'s `odl_tb5_wait_peer(handle, 10000)` times out
+and returns `rcclSystemError`, so `listen`/`connect` fail and RCCL's net proxy surfaces
+`ncclSystemError` from `net_tmp.cc` — which is exactly the chain observed.
+
+**Implication:** the hop-ID leak is not only an `insmod`-time problem. *Any* workload that
+opens/closes the device repeatedly will eventually exhaust hop-IDs. Until BUG 1 is fixed, a
+long-running RCCL job on this transport is not reliable, and the TB-stack-reload workaround
+must be run immediately before each attempt.
+
+**Second-order problem:** the stack-reload workaround itself disturbs `thunderbolt_net`. After
+several reload cycles the IP bond between the nodes stopped passing traffic in both directions
+(interfaces `UP`, slaves `UP`, zero `rx_packets`) while XDomain control messages still flowed —
+i.e. the Thunderbolt fabric was fine but the network driver had desynced. Recovering that
+needed a reboot. Fixing BUG 1 properly (patch above) removes the need for the reload entirely
+and is the highest-value change for anyone trying to use this transport in anger.
