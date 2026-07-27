@@ -68,7 +68,7 @@ should scale it.
 | [`scripts/odl-bringup.sh`](scripts/odl-bringup.sh) | load + single-service bind + wait for READY |
 | [`scripts/odl-measure.sh`](scripts/odl-measure.sh) | latency + bandwidth run |
 | [`scripts/odl-reload.sh`](scripts/odl-reload.sh) | Thunderbolt stack reload — see the hazard note in [FINDINGS.md](FINDINGS.md) before using |
-| [`odl_rdma_stress.c`](odl_rdma_stress.c) | byte-verifying conformance test (`--bidir`, `--latency`, `--mixed`) |
+| [`odl_rdma_stress.c`](odl_rdma_stress.c) | byte-verifying conformance test (`--bidir`, `--latency`) |
 
 ## Before you load anything
 

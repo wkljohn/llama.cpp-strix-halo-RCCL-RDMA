@@ -3,6 +3,9 @@
 **Cross-node inference on AMD Strix Halo — over RDMA on the Thunderbolt cable you
 already have, plus an in-graph RCCL all-reduce for tensor parallelism.**
 
+> **Engineering by [paicon](https://paix-navigator.paicon.com)**
+> This work is part of the [paix-navigator.paicon.com](https://paix-navigator.paicon.com) effort.
+
 The world communicator is **N-rank**, not two: `GGML_NCCL_WORLD` sets the size, rank 0
 serves the `ncclUniqueId` to every peer, and the only constraint the code enforces is
 `world >= 2`. Everything measured here is 2 nodes, because that is the hardware on hand
