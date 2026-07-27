@@ -495,3 +495,86 @@ problem, not a liveness one.
 3. **RX completion for partial reads.** `odl_rq_drain()` posts one WC per `stream_recv`; if the
    driver delivers a 256 KiB message as multiple frames, byte_len accounting and buffer reuse
    need to match what the consumer expects.
+
+---
+
+# What still needs improvement for the 27B — measured, not guessed
+
+`odl_rdma_stress.c` reproduces the ggml-rpc transport's exact wire pattern
+(256 KiB chunks, 24 pre-posted receives, 2 sends in flight) and **verifies every
+byte**, so failures are located precisely instead of inferred from a 20-minute
+benchmark that only reports throughput.
+
+```bash
+gcc -O2 -o odl_rdma_stress odl_rdma_stress.c -libverbs -lpthread
+# both sides: LD_PRELOAD=libodl_tb5_verbs.so ODL_RDMA_GID_IFACE=bond0
+peer:  ./odl_rdma_stress --server --local-ip 10.4.0.2 --total 21G
+head:  ./odl_rdma_stress --client 10.4.0.2 --local-ip 10.4.0.1 --total 21G
+```
+Exit codes: `0` ok, `2` data corruption, `3` stall. Sweepable via
+`--chunk/--rx-depth/--tx-depth` to isolate which parameter breaks it.
+
+## Finding 1 — premature send completions (FIXED)
+
+The first run exposed a bug every llama.cpp run had hidden:
+
+```
+client: PASS: 1024 msgs, 256.0 MiB in 0.26s = 979.2 MiB/s
+server: CORRUPTION at msg 0, first bad word 0 (byte 0 of 262144)
+```
+
+`ibv_post_send()` must consume the payload before returning — callers reuse the
+buffer immediately. `odl_tb5_stream_send()` only queues it, so the worker DMA'd
+whatever the caller had since written, and the completion fired before the bytes
+reached the wire (hence the impossible 979 MiB/s). Fixed by bounce-copying the
+payload at post time.
+
+**This invalidates the earlier "2B works" result**: `llama-bench` measures speed,
+not output correctness, so corrupt weights still produce a plausible t/s number.
+After the fix, 256 MiB verifies clean at 7.7 Gb/s.
+
+## Finding 2 — no fragment sequencing (THE 27B BLOCKER)
+
+At 27B scale the transport now survives **18.5 GiB** and then fails:
+
+```
+recv+verified 73728/86016 (18432.0 MiB)          <- 18.5 GiB byte-perfect
+SHORT msg 73956: got 44686 bytes, expected 262144
+CORRUPTION at msg 73956, first bad word 1006 (byte 8048 of 44686)
+```
+
+Byte 8048 is almost exactly two payload fragments (2 × 4027), so the first two
+fragments are correct and reassembly then desyncs — a dropped fragment.
+
+The root cause is the wire format:
+
+```c
+struct odl_tb5_stream_hdr {
+    __u8 src_id; __u8 dst_id; __u8 flags; __le16 payload_len;
+} __packed;                      /* flags: MSG_START | MSG_END only */
+```
+
+A multi-frame message is reassembled by **blind concatenation** gated only by
+START/END. There is no fragment index, no offset, no message length, no
+checksum — so if any fragment is lost the receiver cannot tell. It simply
+concatenates fewer bytes and delivers a short, silently corrupt message at
+MSG_END. That is precisely the signature above.
+
+### Required improvements, in priority order
+
+1. **Add fragment sequencing to `odl_tb5_stream_hdr`** — a fragment index (or
+   byte offset) plus the total message length. Reassembly must then verify
+   contiguity and reject/report gaps rather than concatenating blindly. Without
+   this, *any* frame loss anywhere corrupts data undetectably, for every
+   consumer, not just llama.cpp. This is the single highest-value change.
+2. **Make loss visible.** Once gaps are detectable, fail the message loudly
+   (drop + counter + `pr_warn`) instead of delivering corruption. Silent
+   corruption is far worse than a clean error.
+3. **Find the drop source.** Only after (1) can this be attributed: 18.5 GiB of
+   clean transfer implies a rare condition — RX repost starvation, frame-pool
+   exhaustion, or an NHI ring wrap — not a systematic bug.
+4. **Then consider retransmission.** With sequencing in place, a NAK/retry for
+   the lost fragment makes the transport robust for arbitrarily large models.
+
+Until (1) exists, a 20.88 GiB model transfer is a coin flip: it needs ~86 000
+messages and ~5.5 million fragments to arrive without a single loss.
