@@ -268,7 +268,7 @@ index 0610c0e..2f1669f 100644
  )
  
 diff --git a/verbs/src/odl_tb5_verbs.h b/verbs/src/odl_tb5_verbs.h
-index ca73a50..13d74d2 100644
+index ca73a50..15466f6 100644
 --- a/verbs/src/odl_tb5_verbs.h
 +++ b/verbs/src/odl_tb5_verbs.h
 @@ -64,6 +64,7 @@
@@ -279,7 +279,14 @@ index ca73a50..13d74d2 100644
  #define ODL_VERBS_COMP_CHANNEL_BACKLOG   64
  #define ODL_VERBS_SQ_DEPTH              64
  
-@@ -139,7 +140,14 @@ struct odl_verbs_qp {
+@@ -136,10 +137,21 @@ struct odl_verbs_qp {
+     struct odl_verbs_cq      *send_cq;
+     struct odl_verbs_cq      *recv_cq;
+     uint8_t                   stream_id;
++    /* BUG15: remote stream to address sends at, taken from
++     * ibv_modify_qp(IBV_QP_DEST_QPN) at the RTR transition. Without this the
++     * worker sent everything to dst_id 0 and nothing reached the peer. */
++    uint8_t                   dest_qp;
  
      /* Work submission queue (async via worker thread) */
      pthread_mutex_t           sq_lock;
@@ -295,7 +302,7 @@ index ca73a50..13d74d2 100644
      int                       sq_head;
      int                       sq_tail;
      int                       sq_count;
-@@ -148,6 +156,19 @@ struct odl_verbs_qp {
+@@ -148,6 +160,19 @@ struct odl_verbs_qp {
      pthread_t                 worker;
      bool                      worker_running;
  
@@ -315,7 +322,7 @@ index ca73a50..13d74d2 100644
      /* Async tracking */
      atomic_int                pending_sends;
      atomic_int                pending_recvs;
-@@ -251,6 +272,7 @@ int odl_modify_qp(struct ibv_qp *, struct ibv_qp_attr *, int);
+@@ -251,6 +276,7 @@ int odl_modify_qp(struct ibv_qp *, struct ibv_qp_attr *, int);
  int odl_query_qp(struct ibv_qp *, struct ibv_qp_attr *, int, struct ibv_qp_init_attr *);
  int odl_post_send(struct ibv_qp *, struct ibv_send_wr *, struct ibv_send_wr **);
  int odl_post_recv(struct ibv_qp *, struct ibv_recv_wr *, struct ibv_recv_wr **);
@@ -548,20 +555,24 @@ index 0000000..19826b9
 +    return EOPNOTSUPP;
 +}
 diff --git a/verbs/src/odl_tb5_verbs_qp.c b/verbs/src/odl_tb5_verbs_qp.c
-index d45260e..40612cf 100644
+index d45260e..548cdd8 100644
 --- a/verbs/src/odl_tb5_verbs_qp.c
 +++ b/verbs/src/odl_tb5_verbs_qp.c
-@@ -68,21 +68,30 @@ static void *odl_qp_worker(void *arg)
+@@ -68,21 +68,33 @@ static void *odl_qp_worker(void *arg)
      odl_tb5_t h = ctx->handle;
  
      while (qp->worker_running) {
 -        struct ibv_send_wr *wr = NULL;
++        /* Make receive progress on EVERY iteration, not only when idle:
++         * a QP with continuous send traffic would otherwise never drain RX. */
++        odl_rq_drain(qp);
+ 
+-        /* Dequeue one work request */
 +        bool     have_wr = false;
 +        uint64_t w_wr_id = 0, w_addr = 0;
 +        uint32_t w_len = 0, w_lkey = 0;
 +        int      w_num_sge = 0;
- 
--        /* Dequeue one work request */
++
 +        /* Dequeue one work request (copies, not caller pointers) */
          pthread_mutex_lock(&qp->sq_lock);
          if (qp->sq_count > 0) {
@@ -584,12 +595,11 @@ index d45260e..40612cf 100644
 +        if (!have_wr) {
 +            /* No send work: make receive progress, then yield briefly.
 +             * The RX drain is what turns posted buffers into completions. */
-+            if (odl_rq_drain(qp) == 0)
-+                odl_worker_poll_fd(qp, 10);
++            odl_worker_poll_fd(qp, 2);
              continue;
          }
  
-@@ -111,19 +120,18 @@ static void *odl_qp_worker(void *arg)
+@@ -111,19 +123,18 @@ static void *odl_qp_worker(void *arg)
          struct ibv_wc wc;
          memset(&wc, 0, sizeof(wc));
  
@@ -601,20 +611,22 @@ index d45260e..40612cf 100644
  
              if (dmabuf_fd >= 0) {
                  ret = odl_tb5_stream_send_dmabuf(
-                     h, qp->stream_id, 0,
+-                    h, qp->stream_id, 0,
 -                    dmabuf_fd, 0, sge->length);
++                    h, qp->stream_id, qp->dest_qp,
 +                    dmabuf_fd, 0, w_len);
              } else {
 -                void *data = (void *)(uintptr_t)sge->addr;
 +                void *data = (void *)(uintptr_t)w_addr;
                  ret = odl_tb5_stream_send(
-                     h, qp->stream_id, 0,
+-                    h, qp->stream_id, 0,
 -                    data, sge->length);
++                    h, qp->stream_id, qp->dest_qp,
 +                    data, w_len);
              }
  
              if (ret == -EAGAIN) {
-@@ -131,7 +139,11 @@ static void *odl_qp_worker(void *arg)
+@@ -131,7 +142,11 @@ static void *odl_qp_worker(void *arg)
                  odl_logverbose("send EAGAIN stream=%u, re-queueing", qp->stream_id);
                  pthread_mutex_lock(&qp->sq_lock);
                  if (qp->sq_count < ODL_VERBS_SQ_DEPTH) {
@@ -627,7 +639,7 @@ index d45260e..40612cf 100644
                      qp->sq_tail = (qp->sq_tail + 1) % ODL_VERBS_SQ_DEPTH;
                      qp->sq_count++;
                  }
-@@ -139,8 +151,9 @@ static void *odl_qp_worker(void *arg)
+@@ -139,8 +154,9 @@ static void *odl_qp_worker(void *arg)
                  continue;
              }
  
@@ -638,7 +650,7 @@ index d45260e..40612cf 100644
              wc.opcode   = IBV_WC_SEND;
              wc.qp_num   = qp->base.qp_num;
  
-@@ -148,6 +161,7 @@ static void *odl_qp_worker(void *arg)
+@@ -148,6 +164,7 @@ static void *odl_qp_worker(void *arg)
                  odl_logerr("send failed stream=%u ret=%d", qp->stream_id, ret);
          } else {
              /* Zero-length send */
@@ -646,7 +658,7 @@ index d45260e..40612cf 100644
              wc.status   = IBV_WC_SUCCESS;
              wc.byte_len = 0;
              wc.opcode   = IBV_WC_SEND;
-@@ -208,6 +222,8 @@ struct ibv_qp *odl_create_qp(struct ibv_pd *pd,
+@@ -208,6 +225,8 @@ struct ibv_qp *odl_create_qp(struct ibv_pd *pd,
  
      /* Initialize SQ */
      pthread_mutex_init(&qp->sq_lock, NULL);
@@ -655,7 +667,21 @@ index d45260e..40612cf 100644
      qp->sq_head  = 0;
      qp->sq_tail  = 0;
      qp->sq_count = 0;
-@@ -322,7 +338,18 @@ int odl_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
+@@ -289,6 +308,13 @@ int odl_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
+     ODL_TRACE_ENTRY();
+     ODL_RETURN_EINVAL_IF(!qp, "null qp");
+ 
++    if (attr_mask & IBV_QP_DEST_QPN) {
++        struct odl_verbs_qp *oqp = odl_qp_from_ibv(qp);
++        oqp->dest_qp = (uint8_t)attr->dest_qp_num;
++        odl_loginfo("modify_qp: qp_num=%u dest_qp_num=%u",
++                    qp->qp_num, attr->dest_qp_num);
++    }
++
+     if (attr_mask & IBV_QP_STATE) {
+         qp->state = attr->qp_state;
+         odl_loginfo("modify_qp: qp_num=%u state=%d -> %d",
+@@ -322,7 +348,18 @@ int odl_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
              return -ENOMEM;
          }
  
@@ -675,7 +701,7 @@ index d45260e..40612cf 100644
          oqp->sq_tail = (oqp->sq_tail + 1) % ODL_VERBS_SQ_DEPTH;
          oqp->sq_count++;
          atomic_fetch_add(&oqp->pending_sends, 1);
-@@ -340,72 +367,98 @@ int odl_post_recv(struct ibv_qp *qp, struct ibv_recv_wr *wr,
+@@ -340,72 +377,98 @@ int odl_post_recv(struct ibv_qp *qp, struct ibv_recv_wr *wr,
                     struct ibv_recv_wr **bad_wr)
  {
      struct odl_verbs_qp *oqp = odl_qp_from_ibv(qp);

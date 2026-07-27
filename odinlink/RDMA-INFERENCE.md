@@ -294,15 +294,21 @@ blocks and the run times out, while the driver shows the stream created and torn
 (`odl_tb5: stream 20 created` / `destroying`). Both peers independently chose stream id 20, so
 that coincidence has not been ruled out as load-bearing. Suspects, in order:
 
-1. **Stream addressing.** `odl_tb5_stream_send(h, stream_id, 0, ...)` sends to peer id `0`;
-   whether the remote side's stream 20 is the intended sink is unverified. A QP pair needs an
-   explicit local↔remote stream binding negotiated at `modify_qp(RTR)` time, using the
-   `dest_qp_num` the consumer supplies — which `odl_modify_qp()` currently ignores entirely
-   (it accepts every transition and stores only `qp_state`).
-2. **RX drain scheduling.** `odl_rq_drain()` currently runs only on the worker's idle path, so
-   a QP with continuous send traffic may starve receives.
+1. ~~**Stream addressing.**~~ **Tried, did not fix.** `odl_modify_qp()` ignored
+   `IBV_QP_DEST_QPN` entirely, so the worker sent everything to `dst_id = 0`. The patch now
+   captures `attr->dest_qp_num` at the RTR transition and addresses sends with it
+   (`odl_tb5_stream_send(h, stream_id, dest_qp, ...)`). Correct and worth keeping, but the
+   stall persists — so `dst_id` is evidently not simply "the remote stream id", and the real
+   local↔remote pairing semantics of `odl_tb5_stream_open(filter_id)` need to be established
+   from the driver side. **This is the open question.**
+2. ~~**RX drain scheduling.**~~ **Tried, did not fix.** `odl_rq_drain()` now runs on every
+   worker iteration rather than only when idle, so send traffic cannot starve receives.
+   Correct, but not the blocker.
 3. **Flow control / chunking.** llama.cpp sends 256 KiB chunks with `RDMA_TX_DEPTH=2` in
    flight; OdinLink's frame pool and E2E credits may need explicit backpressure rather than
-   `-EAGAIN` re-queueing.
-
-Item 1 is the most likely culprit and the natural next step.
+   `-EAGAIN` re-queueing. **Not yet investigated.**
+4. **Stream pairing across nodes.** Both peers independently auto-assigned stream id 20. If
+   `odl_tb5_stream_open()` filters are node-local, two peers can hold "stream 20" that are not
+   connected to each other at all, and no amount of userspace addressing will join them —
+   the CLI's own client/server test does its own pairing handshake that this path skips.
+   **Most likely culprit now; start here.**
