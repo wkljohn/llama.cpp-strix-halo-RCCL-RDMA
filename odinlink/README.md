@@ -1,56 +1,59 @@
 # RDMA over Thunderbolt/USB4 on Strix Halo — OdinLink bring-up
 
-> ## ⚠️ STATUS: TREAT AS UNSAFE ON AMD STRIX HALO — CAUSE NOT YET ISOLATED
+> ## ✅ STATUS: the crash was a local regression, not the upstream driver — now fixed
 >
-> Testing here ended after ~6 hard freezes across two machines. The chain always started with
-> an IOMMU fault on the Thunderbolt controller and took the GPU down with it:
+> An earlier revision of this page told you never to load this driver. **That was wrong, and the
+> cause was our own patch.** Recorded here in full because the retraction matters more than the
+> original claim.
+>
+> While adding the BUG 1 hop-ID fix, a bad patch to `odl_tb5_remove()` silently deleted the
+> function's entire cleanup body — `odl_tb5_rings_stop()`, six `cancel_work_sync()` calls,
+> `synchronize_rcu()`, `list_del_rcu()`, and every buffer/ring free. The driver then did:
 >
 > ```
-> thunderbolt 0000:c7:00.6: AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x003f
->                                                 address=0xffbb8000 flags=0x0020]
-> amdgpu 0000:c5:00.0: probe with driver amdgpu failed with error -22
-> drm_buddy_fini+0x112/0x120 [drm_buddy]
-> BUG: kernel NULL pointer dereference   ->   hard freeze, manual power cycle
+> ... state bookkeeping ...  ->  release hop-ID  ->  kfree(dev)
 > ```
 >
-> The USB4 router shares a firmware/power domain with the iGPU on Strix Halo, so once the router
-> wedges, `amdgpu` can fail to initialise — sometimes on the *next boot* as well.
+> freeing the device and its coherent DMA rings **while the NHI was still transferring into
+> them and six work items still held pointers.** That is a textbook use-after-free, and it
+> explains the whole cascade we had blamed on AMD: `AMD-Vi IO_PAGE_FAULT` at a stale address →
+> USB4 router wedge → (shared firmware domain) `amdgpu` probe -22 → `drm_buddy_fini` NULL
+> deref → hard freeze.
 >
-> **Honesty note:** an earlier version of this page blamed the driver's ring DMA mapping. That
-> claim has been **withdrawn**. The rings do use `dma_alloc_coherent(tb_ring_dma_device(...))`
-> — the correct API — and the crash runs were made with a **locally patched build whose
-> `odl_tb5_remove()` had been accidentally gutted**, freeing the DMA buffers while the rings
-> were still armed. That is its own sufficient explanation for the fault, so those runs prove
-> nothing about upstream. The teardown has been repaired; **the corrected build has not yet been
-> retested.** See [FINDINGS.md](FINDINGS.md) BUG 9.
+> **After restoring the upstream teardown order**, on the same 2× Ryzen AI MAX+ 395 hardware:
 >
-> Until someone reproduces this on a **clean upstream checkout**, assume the risk is real but
-> the cause is unknown. Don't load `odl_tb5` on a machine you cannot afford to power-cycle.
->
-> ## ⛔ Individually dangerous paths (all still true)
->
-> Every item below was reproduced repeatedly on 2× Ryzen AI MAX+ 395. These are **not**
-> theoretical. Several ended in a hard freeze needing a manual power cycle, and twice the
-> **GPU failed to initialise on the following boot** (`amdgpu ... PSP firmware loading
-> failed` → `probe with driver amdgpu failed with error -22`).
->
-> | ❌ Never do this | What happens |
+> | test | result |
 > |---|---|
-> | `rmmod odl_tb5` | NHI DMA rings stay armed → USB4 router wedges → `thunderbolt` core oopses in `tb_cfg_read`/`check_config_address` → GPU dies with it (shared firmware domain) → panic |
-> | Unbind a service to "fix" BUG 2 | **Same teardown path as rmmod.** Crashed a node with no `rmmod` involved. Use `max_devices=1` instead so the extra service never binds |
-> | Leave the module loaded while the handshake fails | The login retry loop **never gives up**. Hammering a wedged router ends in `amdgpu_irq_put` / `drm_buddy_fini` → `BUG: kernel NULL pointer dereference` → freeze. Use `login_max_retries` |
-> | Reload the whole TB stack repeatedly | Wedges the USB4 controller *and* the GPU PSP. Recovery needs a **full power cycle**, not a warm reboot |
+> | `rmmod` (was: "❌ never do this") | clean, <1 s, **3/3 cycles** |
+> | `insmod` → `rmmod` → `insmod` reload | no `enable_paths -12/ENOMEM`, hop-ID correctly released |
+> | `IO_PAGE_FAULT` count | **0** |
+> | kernel oops / `BUG:` | **0** |
+> | GPU (`/dev/kfd`, `rocm-smi`) | healthy throughout, no reboot needed |
 >
-> **Safe operating rules**
-> 1. **Load `odl_tb5` exactly once per boot. Never unload it.** To test a new build, reboot first.
-> 2. **One cable, or `max_devices=1`.** With two cables both services sit at `route=2` (BUG 2) and the handshake cannot complete — and the unbind workaround is itself unsafe.
-> 3. **Bound the retries**: `login_max_retries=20` (default in the patched driver).
-> 4. **Keep a non-Thunderbolt path (LAN/Wi-Fi) to every node.** You will need it.
-> 5. If a boot logs `PSP firmware loading failed`, **power off fully** — a warm reboot will not clear it.
+> The correct teardown order — apply any hop-ID fix **after** the rings are stopped, never in
+> place of them:
 >
-> The patched driver in this repo adds `max_devices`, `only_domain` and `login_max_retries`
-> precisely so none of the dangerous manual steps are needed. See
-> [FINDINGS.md](FINDINGS.md) for root causes and patches.
+> ```
+> send_logout -> cancel_work_sync x6 -> rings_stop -> synchronize_rcu -> list_del_rcu
+>    -> dma_bufs_free -> rings_free -> disable_paths -> release_in_hopid -> kfree
+> ```
+>
+> ### What remains genuinely cautionary
+>
+> These were seen **before** the regression existed and are not retracted, though they are now
+> the *only* open hazards and each deserves re-testing against the repaired build:
+>
+> | ⚠️ Still be careful | Why |
+> |---|---|
+> | Reloading the **whole Thunderbolt stack** (unbind `thunderbolt` PCI driver, not just `odl_tb5`) | Wedged the USB4 controller and the GPU PSP; recovery needed a full power cycle. This is a different operation from `rmmod odl_tb5` and was never disproven |
+> | Unbounded login retries against a wedged router | Fixed by `login_max_retries` (default 20); a give-up path is strictly better than hammering |
+> | Two cables / two bound services | Both land on `route=2` (BUG 2) and the handshake cannot complete. Use `max_devices=1` — a config fix, not a safety one |
+> | A boot logging `PSP firmware loading failed` | Power off fully; a warm reboot will not clear it |
+>
+> **Keep a non-Thunderbolt path (LAN/Wi-Fi) to every node** — good practice regardless.
+>
+> Lesson worth keeping: when a kernel module starts corrupting DMA after you patched it, suspect
+> your patch before you suspect the platform. See [FINDINGS.md](FINDINGS.md) BUG 9.
 
 The RCCL port in this repo is **transport-agnostic**: it calls `ncclAllReduce`, and RCCL picks
 the wire. Over TCP that wire costs **286 µs/op**, which is what keeps cross-node tensor

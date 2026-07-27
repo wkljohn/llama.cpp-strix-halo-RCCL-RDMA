@@ -619,7 +619,7 @@ static int odl_tb5_complete_connection(struct odl_tb5_device *dev)
 
 ---
 
-# BUG 9 — IOMMU fault + USB4/GPU wedge — CAUSE NOT ISOLATED (retracted attribution)
+# BUG 9 — RESOLVED: IOMMU fault was a local use-after-free, not an upstream defect
 
 **Severity: unresolved. Treat the driver as unsafe on AMD Strix Halo, but do _not_ read this
 as a confirmed upstream defect — the earlier version of this section made that claim and it
@@ -680,8 +680,13 @@ These were reproduced against **stock** code and are unaffected by the retractio
 - Repeated whole-TB-stack reloads wedge the USB4 controller and the GPU PSP.
 - An unbounded login-retry loop hammers a wedged router (fixed by `login_max_retries`).
 
-### Status
-**Not retested yet.** The corrected driver has not been run long enough to say whether the
+### Status — RESOLVED
+**Retested and clear.** With the restored teardown, 3/3 `rmmod`+`insmod` cycles on node 1:
+no `IO_PAGE_FAULT`, no oops, no `enable_paths -12`, GPU healthy, no reboot required. The
+`rmmod is unsafe` claim in earlier revisions was itself a symptom of this regression and is
+withdrawn. Superseded text follows for the record.
+
+**(historical)** The corrected driver has not been run long enough to say whether the
 IOMMU fault recurs. Until it has:
 - keep treating a load of `odl_tb5` on a machine you care about as risky;
 - do not cite this section as evidence of an upstream bug;
