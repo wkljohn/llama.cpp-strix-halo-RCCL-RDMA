@@ -420,3 +420,58 @@ shares the same cables. Symptoms and fixes:
 4. **`odl_tb5` and `thunderbolt_net` coexist** (different XDomain services, `prtcid=20300` vs
    `1`), so RDMA and IP run over the same cables simultaneously — but a stack reload resets
    *both*, so expect to re-check the bond every time.
+
+---
+
+# OPEN — PR #20 plugin loads and is selected, but `ncclCommInitRank` fails
+
+Status 2026-07-27 with PR #20 applied, both nodes READY, single USB4 link, one channel.
+
+**The plugin is genuinely in use** — this is the first configuration where RCCL does not fall
+back to sockets:
+
+```
+NCCL INFO Successfully loaded external network plugin .../librccl-net-ODL_TB5.so
+NCCL INFO Initialized NET plugin ODL_TB5
+NCCL INFO Assigned NET plugin ODL_TB5 to comm
+NCCL INFO Using network ODL_TB5
+NCCL INFO Channel 00/01 : 0 1
+```
+
+**But communicator creation then fails** on both ranks:
+
+```
+[Proxy Service] .../transport/net_tmp.cc:1006 -> 2      # 2 = ncclSystemError
+                .../transport/net_tmp.cc:540  -> 2
+                .../transport.cc:47 -> 2 ; transport.cc:196 -> 2
+                .../transport/generic.cc:25 -> 2
+                .../init.cc:2050 -> 2 ; 2413 -> 2 ; 2970 -> 2 ; 3001 -> 2
+ggml_cuda_world_init_once: ncclCommInitRank failed: unhandled system error
+```
+
+i.e. the failure is in the **net-transport proxy connection setup**, not in plugin discovery,
+symbol resolution, or the ABI.
+
+### Ruled out
+- **Device exclusivity** — `/dev/odl_tb5_0` opens twice concurrently without error, and the
+  PR #20 plugin already refcounts a single global handle (`g_handle` / `g_handle_refs`).
+- **Channel count** — same failure with `NCCL_MIN_NCHANNELS=1 NCCL_MAX_NCHANNELS=1`
+  (`Channel 00/01`), so it is not TX/RX buffer contention across channels.
+- **Link state** — both nodes reached `entering READY state` immediately before the run, and
+  `odl_tb5_cli` latency/bandwidth tests pass on the same link.
+- **ABI/symbol** — `ncclNetPlugin_v7` resolves; RCCL logs "Using network ODL_TB5".
+
+### Suspected difference from the PR's tested setup
+PR #20 was validated with **vLLM TP=2 (Ray)**. This workload is
+[llama.cpp-strix-halo-RCCL-RDMA](https://github.com/wkljohn/llama.cpp-strix-halo-RCCL-RDMA),
+which builds the communicator with **`ncclCommInitRank` from two independent processes on two
+machines** (rank 0 = `llama-bench`, rank 1 = `ggml-rpc-server`), rendezvousing via a TCP
+`ncclUniqueId` exchange. That drives a different `listen`/`connect`/`accept` ordering through
+the plugin than a Ray-launched SPMD job, and the two sides initialise at different times
+(rank 1 lazily, on its first `GGML_OP_ALLREDUCE`).
+
+Worth checking in the plugin: whether `connect()`/`accept()` tolerate being called before the
+peer's corresponding call (NCCL requires returning `ncclSuccess` with `*sendComm == NULL` /
+`*recvComm == NULL` so it can be retried, rather than returning an error), and whether the
+5 s `odl_tb5_wait_peer()` inside `connect()` can trip when the peer process has not yet
+reached its own init.
