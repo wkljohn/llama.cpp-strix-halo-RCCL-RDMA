@@ -561,3 +561,58 @@ The workaround does free leaked hop-IDs and *does* work from a healthy state, bu
 it is what produced the wedge above. It should be used **once**, not as a routine recovery
 step. The real fix is the BUG 1 patch (release paths on every teardown path) plus ordering
 ring teardown against in-flight DMA.
+
+### Escalation: `rmmod odl_tb5` is unsafe *even with* unbind-first ordering
+
+A later attempt used the "safe" sequence (unbind all services, sleep, then `rmmod odl_tb5`
+only, leaving the Thunderbolt core loaded). **It still crashed the machine.** Kernel log from
+the crashed boot:
+
+```
+RIP: 0010:check_config_address+0x8d/0xb0 [thunderbolt]
+RIP: 0010:tb_cfg_read+0xa5/0xf0 [thunderbolt]
+RIP: 0010:drm_buddy_fini+0x119/0x120 [drm_buddy]
+RIP: 0010:notifier_chain_register+0x45/0xe0
+```
+
+i.e. after the module went away the Thunderbolt core oopsed doing ordinary config-space
+reads against a router the NHI had wedged, and `amdgpu`'s buddy allocator went down with it
+(shared firmware/power domain on Strix Halo). Result: panic and reboot, repeatedly.
+
+**Operational rule — do not unload this module.**
+- Load `odl_tb5` **exactly once per boot**. Never `rmmod` it, with or without unbinding.
+- To test a new driver build: **reboot first**, then `insmod` the new `.ko`. A reboot is
+  cheap; a wedged USB4 router plus a dead GPU is not.
+- Unbinding an individual *service* (`.../drivers/odl_tb5/unbind`) is fine and is still
+  required for BUG 2 — it is module removal that is dangerous.
+
+This supersedes the "safe unload ordering" suggested above and makes the BUG 1 patch more
+important, not less: if hop-IDs never leak, you never need to reload in the first place.
+
+### Also: BUG 1's first patch was incomplete — `complete_connection()` re-entry leaks
+
+Tracking `in_hopid`/`in_hopid_valid` and releasing on every teardown path was **not
+sufficient**. `odl_tb5_complete_connection()` calls `tb_xdomain_alloc_in_hopid()`
+unconditionally at its head and then overwrites `dev->in_hopid`. Because the function is
+re-entered on **every handshake restart** (peer restart, DMA-verify failure), each retry
+orphans the previously allocated hop-ID. With a fresh boot and the first patch applied, a
+node still reached `enable_paths failed (-12)` after a handful of restarts.
+
+Additional fix — release before re-allocating:
+
+```c
+static int odl_tb5_complete_connection(struct odl_tb5_device *dev)
+{
+        if (dev->in_hopid_valid) {          /* re-entry: drop the old one first */
+                if (dev->tx.started)
+                        tb_xdomain_disable_paths(dev->xd, dev->local_tx_hopid,
+                                                 dev->tx.ring ? dev->tx.ring->hop : -1,
+                                                 dev->in_hopid,
+                                                 dev->rx.ring ? dev->rx.ring->hop : -1);
+                tb_xdomain_release_in_hopid(dev->xd, dev->in_hopid);
+                dev->in_hopid_valid = false;
+        }
+        ret = tb_xdomain_alloc_in_hopid(dev->xd, dev->remote_tx_hopid);
+        ...
+}
+```
