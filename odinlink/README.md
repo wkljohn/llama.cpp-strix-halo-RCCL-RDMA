@@ -1,29 +1,31 @@
 # RDMA over Thunderbolt/USB4 on Strix Halo — OdinLink bring-up
 
-> ## 🛑 STATUS: DO NOT RUN THIS DRIVER ON AMD STRIX HALO
+> ## ⚠️ STATUS: TREAT AS UNSAFE ON AMD STRIX HALO — CAUSE NOT YET ISOLATED
 >
-> After ~6 hard freezes across two machines we stopped. The driver's NHI DMA engine
-> programs addresses the **AMD IOMMU has not mapped**, and the fault cascades into the GPU:
+> Testing here ended after ~6 hard freezes across two machines. The chain always started with
+> an IOMMU fault on the Thunderbolt controller and took the GPU down with it:
 >
 > ```
 > thunderbolt 0000:c7:00.6: AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x003f
 >                                                 address=0xffbb8000 flags=0x0020]
 > amdgpu 0000:c5:00.0: probe with driver amdgpu failed with error -22
-> amdgpu_irq_put+0xc4/0xe0 [amdgpu]   (x10)
 > drm_buddy_fini+0x112/0x120 [drm_buddy]
 > BUG: kernel NULL pointer dereference   ->   hard freeze, manual power cycle
 > ```
 >
-> The IO_PAGE_FAULT is **first** in the chain. The USB4 router wedges, and because it shares a
-> firmware/power domain with the iGPU on Strix Halo, `amdgpu` then fails to initialise — on the
-> *next boot* as well. This reproduced with **no `rmmod`, no unbind, bounded retries, and only
-> one service bound**, i.e. with every mitigation below already applied. It is a DMA-mapping
-> bug in the driver, not something module parameters can fix.
+> The USB4 router shares a firmware/power domain with the iGPU on Strix Halo, so once the router
+> wedges, `amdgpu` can fail to initialise — sometimes on the *next boot* as well.
 >
-> **Do not load `odl_tb5` on a machine you care about** until upstream fixes the ring DMA
-> mapping (and ideally validates with `iommu=pt` off and `CONFIG_IOMMU_DEBUG`). The 22 µs
-> latency result below is real and reproducible, but the cost of obtaining it on this hardware
-> was repeated freezes and two boots where the GPU did not come up at all.
+> **Honesty note:** an earlier version of this page blamed the driver's ring DMA mapping. That
+> claim has been **withdrawn**. The rings do use `dma_alloc_coherent(tb_ring_dma_device(...))`
+> — the correct API — and the crash runs were made with a **locally patched build whose
+> `odl_tb5_remove()` had been accidentally gutted**, freeing the DMA buffers while the rings
+> were still armed. That is its own sufficient explanation for the fault, so those runs prove
+> nothing about upstream. The teardown has been repaired; **the corrected build has not yet been
+> retested.** See [FINDINGS.md](FINDINGS.md) BUG 9.
+>
+> Until someone reproduces this on a **clean upstream checkout**, assume the risk is real but
+> the cause is unknown. Don't load `odl_tb5` on a machine you cannot afford to power-cycle.
 >
 > ## ⛔ Individually dangerous paths (all still true)
 >
@@ -180,7 +182,7 @@ That silent fallback is the single easiest way to "measure RDMA" and actually be
 
 | | |
 |---|---|
-| [`FINDINGS.md`](FINDINGS.md) | 8 bugs, root cause + patch for each, with dmesg evidence |
+| [`FINDINGS.md`](FINDINGS.md) | 9 bugs, root cause + patch for each, with dmesg evidence |
 | [`scripts/odl-bringup.sh`](scripts/odl-bringup.sh) | load + single-service bind + wait for READY |
 | [`scripts/odl-reload.sh`](scripts/odl-reload.sh) | no-reboot TB stack reload (clears the hop-ID leak) |
 | [`scripts/odl-measure.sh`](scripts/odl-measure.sh) | latency + bandwidth run |

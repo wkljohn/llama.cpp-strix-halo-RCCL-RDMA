@@ -619,11 +619,13 @@ static int odl_tb5_complete_connection(struct odl_tb5_device *dev)
 
 ---
 
-# BUG 9 — NHI ring DMA is not IOMMU-mapped → USB4 wedge → GPU death (STOPPER)
+# BUG 9 — IOMMU fault + USB4/GPU wedge — CAUSE NOT ISOLATED (retracted attribution)
 
-**Severity: critical / do-not-run.** This is the finding that ended testing.
+**Severity: unresolved. Treat the driver as unsafe on AMD Strix Halo, but do _not_ read this
+as a confirmed upstream defect — the earlier version of this section made that claim and it
+was not supported by the evidence.**
 
-### Evidence (reproduced ~6 times across two machines)
+### What was actually observed
 ```
 thunderbolt 0000:c7:00.6: AMD-Vi: Event logged [IO_PAGE_FAULT domain=0x003f
                                                 address=0xffbb8000 flags=0x0020]
@@ -631,41 +633,57 @@ amdgpu 0000:c5:00.0: probe with driver amdgpu failed with error -22
 amdgpu_irq_put+0xc4/0xe0 [amdgpu]        (repeated)
 drm_buddy_fini+0x112/0x120 [drm_buddy]
 BUG: kernel NULL pointer dereference, address: 0000000000000000
-RIP: 0010:0x0
+```
+The `IO_PAGE_FAULT` on the Thunderbolt controller comes first; the USB4 router then wedges,
+and because the router shares a firmware/power domain with the iGPU on Strix Halo, `amdgpu`
+fails to initialise — sometimes on the *following* boot too, needing a full power cycle.
+That sequence is real and was seen repeatedly.
+
+### Why the previous root cause was withdrawn
+This section previously asserted the driver hands the NHI unmapped addresses and that the
+ring buffers "must be mapped through the Thunderbolt device's DMA API". **That is wrong.**
+Direct inspection of `odl_tb5_rings_alloc()` shows the buffers are already allocated with
+
+```c
+dma_alloc_coherent(tb_ring_dma_device(dev->tx.ring), ...)
 ```
 
-### Order of events
-1. **`AMD-Vi: IO_PAGE_FAULT` on the Thunderbolt controller** — the NHI DMA engine issues a
-   transaction to an address the AMD IOMMU has no mapping for. This is *first*; everything
-   else follows from it.
-2. The USB4 host router wedges. Subsequent `tb_cfg_read()` / `check_config_address()` from the
-   Thunderbolt core oops.
-3. On Strix Halo the USB4 router and the iGPU share a firmware/power domain, so the GPU's PSP
-   fails (`PSP firmware loading failed`), `amdgpu` probe returns **-22**, and its failure
-   cleanup path (`amdgpu_irq_put`, `drm_buddy_fini`) dereferences NULL.
-4. Hard freeze. A warm reboot often does **not** clear it — the next boot can come up with no
-   GPU at all. Full power cycle required.
+i.e. the correct API against the correct device. The stated defect does not exist.
 
-### What this is not
-It is **not** caused by the operations we previously blamed. It reproduced with all of these
-already avoided:
-- no `rmmod odl_tb5`
-- no service `unbind`
-- `login_max_retries` bounded (no retry storm)
-- `max_devices=1` (single service, no route collision)
+### The confound
+The crashes used to justify this bug were produced by a **locally patched build, not stock
+upstream.** While adding the BUG 1 hop-ID fix, a bad patch to `odl_tb5_remove()` silently
+deleted its entire cleanup body — `odl_tb5_rings_stop()`, six `cancel_work_sync()` calls,
+`synchronize_rcu()`, `list_del_rcu()`, and the buffer/ring frees — leaving:
 
-The trigger is the driver's own DMA ping/pong during link verification.
+```
+  ... state bookkeeping ... -> disable_paths/release_in_hopid -> kfree(dev)
+```
 
-### Suggested direction for upstream
-The ring buffers must be mapped for device DMA through the Thunderbolt device's DMA API
-(`dma_map_single`/`dma_alloc_coherent` against `&nhi->pdev->dev`, or the `tb_ring` owner),
-not merely allocated and handed to the NHI by virtual/physical address. On Intel platforms an
-identity/passthrough IOMMU domain often hides this; AMD-Vi enforces it, so the fault only
-appears on AMD hosts. Worth validating with `CONFIG_IOMMU_DEBUG`, and comparing behaviour
-with `iommu=pt` versus a translating domain.
+So `dev` and its coherent ring buffers were freed **while the NHI rings were still armed and
+work items still held pointers to them.** DMA into freed-and-reallocated memory is an exact
+mechanism for `IO_PAGE_FAULT` at a stale address, and for the wedge that follows. That build
+was loaded during the crash runs quoted above, so those runs **cannot distinguish** an
+upstream DMA defect from this local use-after-free.
 
-### Practical consequence
-**RDMA-over-Thunderbolt via OdinLink is not currently usable on AMD Strix Halo.** The
-measured 22.4 µs latency (see top) is genuine — the transport really is ~13× faster than TCP
-— but the link cannot be kept up long enough to carry a real workload without risking the
-machine.
+`odl_tb5_remove()` has since been restored to the upstream teardown order, with the BUG 1 fix
+re-applied *after* `rings_stop()`/`bufs_free()` rather than in place of them:
+
+```
+send_logout -> cancel_work_sync x6 -> rings_stop -> synchronize_rcu -> list_del_rcu
+   -> dma_bufs_free -> rings_free -> disable_paths -> release_in_hopid -> kfree
+```
+
+### What is still true regardless
+These were reproduced against **stock** code and are unaffected by the retraction:
+- `rmmod` / service `unbind` leave rings armed and can wedge the router (BUG 1 teardown path).
+- Repeated whole-TB-stack reloads wedge the USB4 controller and the GPU PSP.
+- An unbounded login-retry loop hammers a wedged router (fixed by `login_max_retries`).
+
+### Status
+**Not retested yet.** The corrected driver has not been run long enough to say whether the
+IOMMU fault recurs. Until it has:
+- keep treating a load of `odl_tb5` on a machine you care about as risky;
+- do not cite this section as evidence of an upstream bug;
+- if you reproduce `IO_PAGE_FAULT` on a **clean upstream checkout** with no local patches,
+  that would be a genuine finding worth reporting — this one was not.
