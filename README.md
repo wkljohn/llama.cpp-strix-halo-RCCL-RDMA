@@ -40,7 +40,7 @@ RPC work at all** (see below).
 | | |
 |---|---|
 | ✅ **Tested** | 2× Strix Halo gfx1151, Thunderbolt/USB4 bond, **TCP**. Correct (`reduced to 1.50`); RCCL beats butterfly on 27B (**+7–18%**, re-verified **+13% clean**). RCCL confirmed binding the bond — `NCCL_DEBUG=INFO`: `NET/Socket : Using [0]bond0:10.4.0.1`. |
-| ⏳ **Pending hardware** | ConnectX RDMA NIC. The port is transport-agnostic — RCCL auto-uses IB verbs when present (`NCCL_IB_DISABLE=0`). RDMA (~5 µs/op vs TCP's ~286 µs) is what should tip TP past pipeline. |
+| ⚡ **RDMA measured** | **22.42 µs median** over Thunderbolt/USB4 via [OdinLink](odinlink/) — ~13× better than TCP's 286 µs/op, **no NIC purchase**. Wiring RCCL onto it needs upstream [PR #20](https://github.com/Geramy/OdinLink-Five/pull/20); see [odinlink/FINDINGS.md](odinlink/FINDINGS.md). |
 
 ## Measured (2 nodes, bond, TCP, in-container ROCm 7.14)
 
