@@ -41,8 +41,11 @@ Numbers live in [RESULTS.md](RESULTS.md). Recipes live in
 | 21 | Send completed before the payload was on the wire | silent data corruption at 979 MiB/s | **fixed here** |
 | 22 | No fragment sequencing in the wire header | a dropped fragment becomes a silent short message | **fixed here** |
 | 23 | Bidirectional traffic deadlocks (three causes) | the 27B blocker | **fixed here** |
-| 24 | Destroying a stream never wakes its receive waiters | closing an RCCL comm can hang forever | **open** |
+| 24 | Destroying a stream never wakes its receive waiters | closing an RCCL comm hung forever | **fixed here** |
 | 25 | Plugin `connect`/`accept` return errors instead of retry | violates the RCCL v7 non-blocking contract | **open** |
+| 26 | `remove()` never returns the `max_devices` slot | one peer restart wedges the link until a module reload | **fixed here** |
+| 27 | Duplex traffic loses two consecutive fragments | ~1 run in 4 corrupts; **blocks collectives** | **open** |
+| 28 | RX callback ignores NHI error flags | hardware-flagged frames accepted as valid | **open** |
 
 "Fixed here" means the patch is on the
 [`strix-halo-verbs-fixes` branch](https://github.com/wkljohn/OdinLink-Five/tree/strix-halo-verbs-fixes)
@@ -288,9 +291,14 @@ RCCL requires versioned symbols (`IBVERBS_1.1/1.8/1.10/1.12`) it does not export
 **Superseded by PR #20**, found open on the same hardware class. It rewrites the plugin
 host-staged (`NCCL_PTR_HOST`) with a per-connection FIFO worker, fixes the ABI
 including a `char[128]`-vs-`char*` properties defect not identified here, and raises
-the driver's per-stream `rx_queue_max` from 256 to 65536 — a ~1 MB message chunks
-into ~264 frames, so the queue filled and `odl_tb5_rx_callback()` **silently dropped**
-frames under duplex load. That is why collectives hung rather than merely crashed.
+the driver's per-stream `rx_queue_max` from 256 to 65536, so a backlog no longer makes
+`odl_tb5_rx_callback()` **silently drop** work under duplex load.
+
+*Correction:* earlier revisions here called that a **fragment** limit and repeated PR #20's
+"a ~1 MB message chunks into ~264 frames" reasoning. In this tree the limit applies to
+**completed messages** enqueued after reassembly, not to individual fragments. The old 256
+cap could still drop completed messages under backlog, but the per-fragment framing of the
+explanation was wrong for this source.
 PR #20 reports TP=2 Llama-3.1-8B beating TCP by ~17–26 % on decode.
 
 ---
@@ -732,10 +740,12 @@ diagnostic that prints the failing arithmetic. Build those first.
 
 ---
 
-# BUG 24 — destroying a stream never wakes its receive waiters (OPEN)
+# BUG 24 — destroying a stream never wakes its receive waiters (FIXED)
 
-**Severity: high for RCCL.** Found by two independent source reviews, not yet by a test —
-`--bidir` exercises steady-state traffic, not teardown, so nothing here reproduces it.
+**Severity: high for RCCL.** Found by two independent source reviews, then reproduced and
+fixed. `--bidir` exercises steady-state traffic, not teardown, which is why it survived;
+`tests/odl_lifecycle_test.c` now covers it. Before the fix a blocked receive never
+returned; after it, it returns `-ESHUTDOWN` in 1.00 s.
 
 The RCCL plugin's shutdown sets a stop flag, closes the stream, and joins the receive
 worker — the close is *meant* to make the blocked receive fail so the worker observes the
@@ -777,6 +787,69 @@ single receive buffer but does not reject `n > 1`, so a multi-buffer receive wou
 silently mishandled rather than refused.
 
 Neither is yet reproduced on hardware; both are source findings.
+
+---
+
+# BUG 27 — duplex traffic loses two consecutive fragments (OPEN)
+
+**Severity: blocks collectives.** This is why `-sm tensor` over RDMA cannot be attempted.
+
+Roughly **1 in 4** bidirectional 512 MiB runs corrupts. Unidirectional has never failed.
+Reproduces on the frozen `rdma-working-2026-07-27` driver, so it predates the teardown work.
+
+The fragment sequencing added in BUG 22 detects it. Six gaps captured across both nodes:
+
+```
+lost 61,62   lost 56,57   lost 36,37   lost 23,24   lost 40,41   lost 50,51
+```
+
+**Always exactly two consecutive fragments** — never one, never three — at *varying*
+positions. Independent of `tx_depth` (1, 2 and 4 all lose exactly two) and of chunk size
+above the batch threshold.
+
+Loss is detected but not repaired (no retransmit), so a dropped message desynchronises the
+stream and the verifier reports corruption on a *later* message. That is why the offsets
+look erratic — sometimes byte 0, sometimes mid-message. The first casualty is the message
+that vanished, not the one that fails verification.
+
+### Hypotheses already tested and killed
+
+Recorded so nobody re-runs them:
+
+| hypothesis | why it died |
+|---|---|
+| Chunk-size threshold | Intermittent at every size above `THROUGHPUT_THRESH`: 256 KiB failed 2/2 in one sitting, passed 5/6 in another |
+| Send depth | `tx_depth` 1, 2 and 4 all lose exactly two; depth 1 still corrupts |
+| Batch-buffer overflow | A 256 KiB message needs 66 frames and a batch holds 64 (payload is 4024/frame after the BUG 20 tail reserve, not 4096). The arithmetic matches "exactly two" — but it predicts loss at a **fixed boundary**, and the measured positions vary. Killed by position data |
+| `odl_tb5_frame_pool_get_batch()` partial allocation | The function has **no callers**; dead code |
+
+64 KiB chunks pass consistently, but `ODL_TB5_THROUGHPUT_THRESH = 65536` means they never
+enter batch mode — a different code path, not evidence about size.
+
+### Live candidate
+
+See BUG 28. The RX callback never examines NHI error flags, so hardware-dropped or
+error-flagged frames would be invisible — which fits pair-loss at arbitrary positions far
+better than any fixed-boundary mechanism. **Untested.** The next step is to count the flags
+rather than form a fifth hypothesis.
+
+---
+
+# BUG 28 — RX callback ignores NHI error flags (OPEN)
+
+The receive path validates only `frame->size` before consuming a frame. It never inspects
+hardware CRC, overrun or descriptor-validity flags, and keeps no counters for them.
+
+Two consequences. A frame the hardware knows is bad is accepted as good. And when frames go
+missing there is no evidence to inspect, because the one place that could report it is
+silent — which is what makes BUG 27 hard to attribute.
+
+The wire format also carries **no checksum** (`driver/uapi/odl_tb5_uapi.h`), so fragment
+sequencing proves *continuity*, not *integrity*.
+
+**Fix:** check the flags before copying; count CRC errors, overruns, short descriptors,
+`payload_len` exceeding the descriptor, fragment gaps and assembly failures; expose them
+read-only. Do not rate-limit away the only evidence.
 
 ---
 

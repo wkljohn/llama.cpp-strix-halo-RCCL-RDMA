@@ -76,7 +76,10 @@ export ODL_RDMA_GID_IFACE=bond0
 ./odl_rdma_stress --client 10.4.0.2 --local-ip 10.4.0.1 --total 2G --bidir
 ```
 
-Expect `PASS: 8192 msgs ... recv+verified 8192/8192` on **both** peers.
+`PASS: 8192 msgs ... recv+verified 8192/8192` on **both** peers is the
+**acceptance target, not the current expected result** — duplex corrupts roughly
+1 run in 4 (see [RESULTS.md](RESULTS.md)). Treat a single pass as luck; require
+20 consecutive clean runs before trusting it.
 Exit codes: `0` ok, `2` data corruption, `3` stall.
 
 ## 5. Point RCCL at OdinLink
@@ -128,10 +131,16 @@ TCP. Always check.
 **Plugin binding is verified. A tensor-parallel benchmark over it is not.**
 
 RCCL selects `ODL_TB5` instead of sockets — the log block above is real output from this
-rig. What has *not* been done is a completed `-sm tensor` run over that link. Nothing is
-known to block it: `-sm tensor` runs over TCP (27B at 3.65/4.02 t/s, in the repo root),
+rig. What has *not* been done is a completed `-sm tensor` run over that link.
+
+> **The transport blocks it.** Duplex traffic loses two consecutive fragments roughly
+> 1 run in 4 ([RESULTS.md](RESULTS.md)). RCCL assumes reliable delivery and is far more
+> duplex-heavy than the RPC path, so running collectives over this today would produce a
+> confusing failure, not a measurement. **Fix the transport first.**
+
+`-sm tensor` itself is fine — it runs over TCP (27B at 3.65/4.02 t/s, in the repo root),
 and the rendezvous deadlock that once stopped it is fixed
-([FINDINGS.md](FINDINGS.md) BUG 12). The run has simply not been made.
+([FINDINGS.md](FINDINGS.md) BUG 12). The obstacle is the wire, not the collective.
 
 Everything in [RESULTS.md](RESULTS.md) with a t/s figure is `-sm layer` (pipeline) over
 the RPC transport, not RCCL tensor parallel. The TP numbers in the repo root are TCP-era.
@@ -140,8 +149,9 @@ the RPC transport, not RCCL tensor parallel. The TP numbers in the repo root are
 
 Go in this order — each stage isolates a different failure:
 
-1. `odl_rdma_stress --bidir` — transport is byte-clean. Skip and you cannot tell a
-   transport fault from an RCCL fault.
+1. **Transport gate.** `odl_rdma_stress --bidir`, **20 consecutive clean runs**. One pass
+   is luck — that is exactly how the retracted 2 GiB claim was produced. Do not proceed
+   on a single green run.
 2. `tests/test-world-allreduce` with `NCCL_NET_PLUGIN=ODL_TB5` — the collective alone,
    no llama.cpp. Expect `reduced to 1.50`.
 3. 2B model, `-sm tensor`. 4. 27B.
@@ -150,9 +160,11 @@ Go in this order — each stage isolates a different failure:
 without an error. Watch `bond0` byte counters across a run — flat means RDMA carried it —
 and do not trust a t/s number as evidence of transport.
 
-Two open defects are likely to bite collectives specifically: teardown can hang
-(BUG 24) and `connect`/`accept` return errors where RCCL expects a retry (BUG 25). Both
-are source findings, not yet reproduced.
+Also still open and likely to bite collectives: `connect`/`accept` return errors where
+RCCL v7 requires success with a NULL comm so it can retry, and `irecv` does not reject
+`n > 1` (BUG 25). Teardown (BUG 24) is fixed and covered by `tests/odl_lifecycle_test.c`
+— note the constraint it documents: cancel a receive worker with an explicit
+`STREAM_CLOSE`, never by closing the fd and joining.
 
 ## Notes / known limits
 

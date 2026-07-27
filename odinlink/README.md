@@ -38,10 +38,11 @@ Then pick your path:
 | | |
 |---|---|
 | ✅ **Working** | 27B Q6_K across 2 nodes over OdinLink RDMA, `-sm layer`, **9.16 t/s** — faster than `thunderbolt_ibverbs` (9.07) and TCP (8.83) |
-| ✅ **Byte-verified** | 21 GiB unidirectional and 2 GiB each way bidirectional, every byte checked |
+| ✅ **Byte-verified, one direction** | 21 GiB unidirectional, every byte checked |
+| ❌ **Bidirectional is NOT reliable** | ~1 duplex run in 4 corrupts: two consecutive fragments lost, detected but not repaired. Reproduces on the frozen driver too. See [RESULTS.md](RESULTS.md) — **blocks collectives** |
 | ⚠️ **LD_PRELOAD only** | OdinLink registers no kernel `ib_device`, so discovery is a preload shim. Anything not inheriting the preload cannot see it (BUG 11) |
 | ⚠️ **Loss detected, not repaired** | Fragment sequencing makes a dropped fragment a loud error instead of silent corruption; there is no retransmit (BUG 22) |
-| ⬜ **`-sm tensor` untested over RDMA** | Nothing blocks it — TP runs over TCP and the old rendezvous deadlock is fixed (BUG 12). The run pointing TP at the plugin has just not been made. Two open defects may bite collectives first: BUG 24, BUG 25 |
+| ⛔ **`-sm tensor` blocked over RDMA** | Not by RCCL — by the transport. Duplex loses messages (above), and RCCL assumes reliable delivery. Fix that first. BUG 25 is also still open |
 
 ## Why bother
 

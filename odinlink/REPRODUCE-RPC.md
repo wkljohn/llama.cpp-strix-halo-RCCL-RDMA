@@ -66,9 +66,11 @@ export ODL_RDMA_GID_IFACE=bond0
 ./odl_rdma_stress --client 10.4.0.2 --local-ip 10.4.0.1 --total 2G --bidir
 ```
 
-Expect `recv+verified 8192/8192` on **both** peers. Exit codes: `0` ok, `2` data
-corruption, `3` stall. `--bidir` matters — the request/response pattern on one QP is
-what broke the 27B when unidirectional bulk was already running 21 GiB clean.
+`recv+verified 8192/8192` on **both** peers is the acceptance target. **Expect it to
+fail roughly 1 run in 4** — duplex transport is currently unreliable, see
+[RESULTS.md](RESULTS.md). Exit codes: `0` ok, `2` data corruption, `3` stall.
+`--bidir` matters — the request/response pattern on one QP is what broke the 27B
+while unidirectional bulk ran 21 GiB clean, and it is still the failing case.
 
 ## 4. Run inference
 

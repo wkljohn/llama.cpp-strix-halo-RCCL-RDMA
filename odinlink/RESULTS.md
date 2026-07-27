@@ -33,19 +33,67 @@ are for *capacity*, not speed. RDMA recovers about half the cross-node penalty
 > `ODL_TB5` plugin simply has not been done yet. See
 > [REPRODUCE-RCCL.md](REPRODUCE-RCCL.md).
 
-## Transport — byte-verified
+## Transport
+
+> ## ⚠️ Bidirectional transport is NOT reliable. Retracted 2026-07-27.
+>
+> This section previously reported *"bidirectional, 2 GiB each way — 8192/8192
+> verified both peers, 9.84 Gb/s full duplex"* as a settled result. **It does not
+> reproduce.** Re-measured across ~20 duplex runs, roughly **1 in 4 corrupts**.
+>
+> The original figure was a single passing run recorded as if it were a property.
+> That is the same mistake this page warns about elsewhere, made here.
+>
+> The failure also reproduces on the frozen pre-change driver
+> (`rdma-working-2026-07-27`), so it is not caused by the teardown fixes.
 
 | test | result |
 |---|---|
-| unidirectional bulk, 21 GiB | **86016/86016 messages verified**, 8.38 Gb/s |
-| bidirectional, 2 GiB each way | **8192/8192 verified both peers**, 9.84 Gb/s full duplex |
+| unidirectional bulk, 21 GiB | **86016/86016 verified**, 8.38 Gb/s |
+| unidirectional 512 MiB, 256 KiB chunk | verified, 7.91 Gb/s |
 | 256 MiB smoke | verified, 7.7 Gb/s |
+| **bidirectional 512 MiB, 256 KiB chunk** | **~1 run in 4 corrupts** (≈10 pass / 4 fail) |
+| bidirectional 512 MiB, 64 KiB chunk | passed every run — but 64 KiB never enters batch mode (`THROUGHPUT_THRESH = 65536`), so this is a different code path, not evidence the bug is size-dependent |
+
+**Unidirectional has not failed once.** Every failure to date needs duplex load.
+
+### What the failure actually is
+
+The driver's fragment sequencing detects it. Six gaps captured across both nodes:
+
+```
+lost 61,62   lost 56,57   lost 36,37   lost 23,24   lost 40,41   lost 50,51
+```
+
+**Always exactly two consecutive fragments, never one, never three** — and at
+varying positions within the message, not at a fixed boundary. Independent of
+`tx_depth` (1, 2 and 4 all lose exactly two) and of chunk size.
+
+Loss is *detected* but not repaired — there is no retransmit (BUG 22) — so one
+dropped message desynchronises the stream and the verifier then reports
+corruption on later messages. That is why the reported offsets look erratic
+(sometimes byte 0, sometimes mid-message): the first casualty is the message
+that vanished, not the one that fails verification.
+
+**Mechanism not yet established.** Two hypotheses have already been tested and
+killed: chunk-size threshold (it is intermittent at every size above the batch
+threshold) and batch-buffer overflow (that predicts loss at a fixed boundary;
+the measured positions vary). A live candidate is that the RX callback never
+examines NHI error flags — it checks only `frame->size` — so hardware-flagged
+frames would be lost invisibly. Untested.
+
+### Why this matters more for collectives than for RPC
+
+`-sm layer` inference works over this transport because pipeline parallelism is
+mostly one-directional and light per token, so it rarely meets the failure.
+RCCL is far more duplex-heavy and assumes reliable delivery. **Do not treat this
+transport as ready for collectives until duplex passes a real gate** — 20
+consecutive clean 512 MiB duplex runs, not one lucky pass.
 
 Verification is byte-level with a position-dependent pattern
 (`odl_rdma_stress.c`), so truncation, reordering, dropped fragments and stale
-buffers all fail loudly. This matters: `llama-bench` measures speed, not
-correctness, so a corrupting transport still prints a plausible t/s — and did,
-before the bounce-buffer fix.
+buffers all fail loudly. That is what caught this. Note it proves *continuity*,
+not integrity: the wire format carries no checksum.
 
 ## Latency — CLI ping-pong RTT, 2000 iterations
 
