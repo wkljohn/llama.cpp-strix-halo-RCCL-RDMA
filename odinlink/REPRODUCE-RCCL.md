@@ -81,9 +81,25 @@ Exit codes: `0` ok, `2` data corruption, `3` stall.
 
 ## 5. Point RCCL at OdinLink
 
+**Two gotchas here, both of which silently drop you onto TCP.**
+
+**(a) The built filename is not what RCCL looks for.** The build produces
+`librccl_net_odl_tb5.so` (underscores, lowercase) but RCCL `dlopen`s
+`librccl-net-<PLUGIN_NAME>.so` — hyphens, and the plugin name's exact case:
+
+```bash
+cd OdinLink-Five/build/rccl
+ln -sf librccl_net_odl_tb5.so librccl-net-ODL_TB5.so
+ln -sf librccl_net_odl_tb5.so libnccl-net-ODL_TB5.so   # for NCCL-named lookups
+```
+
+**(b) `NCCL_PLUGIN_DIR` is NOT honoured** by this RCCL build — the plugin is
+resolved through the dynamic loader, so the directory must be on
+`LD_LIBRARY_PATH`:
+
 ```bash
 export NCCL_NET_PLUGIN=ODL_TB5
-export NCCL_PLUGIN_DIR=/path/to/OdinLink-Five/build/rccl
+export LD_LIBRARY_PATH=/path/to/OdinLink-Five/build/rccl:$LD_LIBRARY_PATH
 export NCCL_SOCKET_IFNAME=bond0     # bootstrap only; payload goes over RDMA
 export NCCL_IB_DISABLE=1 NCCL_CUMEM_ENABLE=0
 export NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NET
@@ -92,10 +108,17 @@ export NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NET
 Confirm from the log that it actually bound:
 
 ```
-NCCL INFO Initialized NET plugin ODL_TB5     <- good
-NCCL INFO ... is unsupported                 <- rejected, silently fell back
-NCCL INFO NET/Socket : Using [0]bond0        <- you are NOT on RDMA
+NCCL INFO NET/Plugin: Loaded net plugin ODL_TB5 (v7)          <- good
+NCCL INFO Successfully loaded external network plugin .../librccl-net-ODL_TB5.so
+NCCL INFO Initialized NET plugin ODL_TB5
+NCCL INFO Using network ODL_TB5                               <- good
+
+NCCL INFO NET/Plugin: Could not find: ODL_TB5 librccl-net-ODL_TB5.so   <- (a) or (b)
+NCCL INFO Using network Socket                                <- you are on TCP
 ```
+
+Verified working output on this rig is the first block. If you see
+`Could not find`, you hit gotcha (a) or (b) above.
 
 That silent fallback is the easiest way to "measure RDMA" and actually measure
 TCP. Always check.
