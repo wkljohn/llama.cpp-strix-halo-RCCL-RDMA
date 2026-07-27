@@ -11,8 +11,8 @@
 > ```
 >
 > Upstream is [Geramy/OdinLink-Five](https://github.com/Geramy/OdinLink-Five)
-> (driver GPL-2.0, verbs provider MIT). The branch is 7 commits on top of
-> upstream `ed60505`. `patches/odinlink-verbs-and-driver-fixes.patch` is kept in
+> (driver GPL-2.0, verbs provider MIT). The branch sits on upstream `ed60505` —
+> see the [full diff](https://github.com/Geramy/OdinLink-Five/compare/ed60505...wkljohn:strix-halo-verbs-fixes). `patches/odinlink-verbs-and-driver-fixes.patch` is kept in
 > sync for anyone who prefers patching a pristine checkout.
 >
 > Measured results: [RESULTS.md](RESULTS.md).
