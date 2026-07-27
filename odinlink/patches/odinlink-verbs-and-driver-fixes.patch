@@ -237,10 +237,33 @@ index 1c1bc38..d849e54 100644
  	mutex_lock(&dev->state_lock);
  	dev->state = ODL_TB5_STATE_HANDSHAKE;
 diff --git a/driver/odl_tb5_ring_dma.c b/driver/odl_tb5_ring_dma.c
-index aaae32d..cacb3b8 100644
+index aaae32d..84c03d1 100644
 --- a/driver/odl_tb5_ring_dma.c
 +++ b/driver/odl_tb5_ring_dma.c
-@@ -1344,14 +1344,17 @@ struct odl_tb5_stream *odl_tb5_stream_create(struct odl_tb5_device *dev,
+@@ -289,6 +289,9 @@ void odl_tb5_rx_callback(struct tb_ring *ring,
+ 								    payload_len));
+ 							void *nb = kmalloc(new_cap,
+ 									   GFP_ATOMIC);
++							if (!nb)
++								pr_warn_ratelimited("odl_tb5: rx_asm kmalloc(%zu, GFP_ATOMIC) FAILED - payload will be dropped\n",
++										    new_cap);
+ 							if (nb) {
+ 								if (stream->rx_asm_buf)
+ 									memcpy(nb,
+@@ -306,6 +309,12 @@ void odl_tb5_rx_callback(struct tb_ring *ring,
+ 							       stream->rx_asm_len,
+ 							       payload, payload_len);
+ 							stream->rx_asm_len += payload_len;
++						} else {
++							pr_warn_ratelimited("odl_tb5: rx_asm DROP payload_len=%u asm_len=%zu cap=%zu buf=%p\n",
++									    payload_len,
++									    stream->rx_asm_len,
++									    stream->rx_asm_cap,
++									    stream->rx_asm_buf);
+ 						}
+ 
+ 						/* End of message — enqueue complete msg */
+@@ -1344,14 +1353,17 @@ struct odl_tb5_stream *odl_tb5_stream_create(struct odl_tb5_device *dev,
  	INIT_LIST_HEAD(&stream->rx_queue);
  	spin_lock_init(&stream->rx_lock);
  	stream->rx_queue_len = 0;
@@ -260,7 +283,7 @@ index aaae32d..cacb3b8 100644
  	mutex_unlock(&dev->stream_lock);
  
  	if (owner) {
-@@ -1427,9 +1430,12 @@ struct odl_tb5_stream *odl_tb5_stream_lookup(struct odl_tb5_device *dev,
+@@ -1427,9 +1439,12 @@ struct odl_tb5_stream *odl_tb5_stream_lookup(struct odl_tb5_device *dev,
  	struct odl_tb5_stream *stream;
  
  	rcu_read_lock();
@@ -275,7 +298,43 @@ index aaae32d..cacb3b8 100644
  			rcu_read_unlock();
  			return stream;
  		}
-@@ -1766,10 +1772,18 @@ bool odl_tb5_stream_can_send(struct odl_tb5_stream *stream)
+@@ -1650,6 +1665,9 @@ static int odl_tb5_stream_send_throughput(struct odl_tb5_stream *stream,
+ 			bpool->free_count > 0,
+ 			msecs_to_jiffies(5000));
+ 		if (ret <= 0) {
++			pr_warn_ratelimited("odl_tb5: throughput TX stalled waiting for batch buf (free=%d ret=%ld sent=%zu/%zu)\n",
++					    bpool->free_count, ret,
++					    total_sent, len);
+ 			if (ret == 0)
+ 				ret = -ETIMEDOUT;
+ 			goto wait_pending;
+@@ -1762,14 +1780,44 @@ wait_pending:
+  * Non-blocking availability checks (for poll/epoll + async ioctl).
+  * Returns true if a send/recv would not block.
+  */
++extern unsigned int odl_busy_poll_us;
++
++/* Optional bounded busy-poll for an RX completion before sleeping.  The RX
++ * softirq (odl_tb5_rx_callback) increments rx_complete on another CPU, so a
++ * spinning reader sees it within cache-coherency latency and skips the
++ * context-switch wake (~10-15 us on this box).  Bounded + falls back to
++ * wait_event, so it never hangs.  Off unless odl_busy_poll_us > 0.
++ * (upstream PR #21) */
++static inline void odl_tb5_rx_busy_poll(struct odl_tb5_stream *stream)
++{
++	ktime_t deadline;
++
++	if (!odl_busy_poll_us || atomic_read(&stream->rx_complete) > 0)
++		return;
++	deadline = ktime_add_ns(ktime_get(), (u64)odl_busy_poll_us * 1000);
++	while (atomic_read(&stream->rx_complete) == 0) {
++		if (ktime_after(ktime_get(), deadline))
++			break;
++		cpu_relax();
++	}
++}
++
+ bool odl_tb5_stream_can_send(struct odl_tb5_stream *stream)
  {
  	struct odl_tb5_device *dev = stream->dev;
  	struct odl_tb5_frame_pool *pool = &dev->frame_pool;
@@ -296,7 +355,7 @@ index aaae32d..cacb3b8 100644
  }
  
  bool odl_tb5_stream_can_recv(struct odl_tb5_stream *stream)
-@@ -1790,6 +1804,7 @@ int odl_tb5_stream_send(struct odl_tb5_stream *stream,
+@@ -1790,6 +1838,7 @@ int odl_tb5_stream_send(struct odl_tb5_stream *stream,
  	struct odl_tb5_device *dev = stream->dev;
  	enum odl_tb5_tx_mode mode;
  
@@ -304,14 +363,39 @@ index aaae32d..cacb3b8 100644
  	if (dev->state != ODL_TB5_STATE_READY)
  		return -ENOTCONN;
  
+@@ -1920,6 +1969,7 @@ int odl_tb5_stream_recv(struct odl_tb5_stream *stream,
+ 	int ret = 0;
+ 
+ 	/* Wait for a complete assembled message */
++	odl_tb5_rx_busy_poll(stream);
+ 	ret = wait_event_interruptible(stream->rx_waitq,
+ 		atomic_read(&stream->rx_complete) > 0);
+ 	if (ret)
+@@ -1954,6 +2004,8 @@ int odl_tb5_stream_wait_rx(struct odl_tb5_stream *stream, u32 timeout_ms)
+ {
+ 	long ret;
+ 
++	odl_tb5_rx_busy_poll(stream);
++
+ 	if (timeout_ms == 0) {
+ 		ret = wait_event_interruptible(stream->rx_waitq,
+ 			atomic_read(&stream->rx_complete) > 0);
 diff --git a/driver/odl_tb5_service.c b/driver/odl_tb5_service.c
-index 350dbb3..6abe999 100644
+index 350dbb3..aa92c0d 100644
 --- a/driver/odl_tb5_service.c
 +++ b/driver/odl_tb5_service.c
-@@ -38,6 +38,16 @@ MODULE_PARM_DESC(protocol,
+@@ -38,6 +38,24 @@ MODULE_PARM_DESC(protocol,
  
  bool odl_e2e = true;
  module_param_named(e2e, odl_e2e, bool, 0444);
++
++/* upstream PR #21: bounded RX busy-poll before sleeping. The RX softirq
++ * increments rx_complete on another CPU, so a spinning reader sees it within
++ * cache-coherency latency and skips a ~10-15 us context-switch wake. */
++unsigned int odl_busy_poll_us = 0;
++module_param(odl_busy_poll_us, uint, 0644);
++MODULE_PARM_DESC(odl_busy_poll_us,
++	"Bounded RX busy-poll window in microseconds before sleeping (0 = off)");
 +
 +/* Bind at most N XDomain services (0 = unlimited).  With two Thunderbolt
 + * cables both peer services sit at route=2 (BUG 2) and the handshake cannot
@@ -325,7 +409,7 @@ index 350dbb3..6abe999 100644
  MODULE_PARM_DESC(e2e,
  	"Enable end-to-end flow control (default=1). Set 0 for TB3 controllers "
  	"that do not support RING_FLAG_E2E.");
-@@ -62,6 +72,13 @@ MODULE_DEVICE_TABLE(tbsvc, odl_tb5_ids);
+@@ -62,6 +80,13 @@ MODULE_DEVICE_TABLE(tbsvc, odl_tb5_ids);
  static int odl_tb5_probe(struct tb_service *svc,
  			 const struct tb_service_id *id)
  {
@@ -339,7 +423,27 @@ index 350dbb3..6abe999 100644
  	struct odl_tb5_device *dev;
  	int ret;
  
-@@ -156,6 +173,8 @@ err_rings:
+@@ -107,8 +132,17 @@ static int odl_tb5_probe(struct tb_service *svc,
+ 	/* Adaptive TX mode defaults */
+ 	dev->tx_adaptive.mode = ODL_TB5_TX_LATENCY;
+ 	dev->tx_adaptive.consecutive_low = 0;
+-	dev->tx_adaptive.high_watermark = odl_ring_size * 3 / 4;
+-	dev->tx_adaptive.low_watermark  = odl_ring_size / 4;
++	/* Watermarks gate the shared frame pool (ODL_TB5_FRAME_POOL_SIZE
++	 * slots), NOT the NHI ring depth.  With large odl_ring_size the raw
++	 * ring*3/4 exceeds the pool, so the adaptive logic can never trip and
++	 * TX flow control is miscalibrated.  Clamp to the usable pool.
++	 * (upstream PR #20) */
++	dev->tx_adaptive.high_watermark =
++		min_t(unsigned int, odl_ring_size * 3 / 4,
++		      ODL_TB5_FRAME_POOL_SIZE - ODL_TB5_TX_POOL_RESERVE);
++	dev->tx_adaptive.low_watermark  =
++		min_t(unsigned int, odl_ring_size / 4,
++		      (ODL_TB5_FRAME_POOL_SIZE - ODL_TB5_TX_POOL_RESERVE) / 2);
+ 
+ 	ret = odl_tb5_chardev_create(dev);
+ 	if (ret) {
+@@ -156,6 +190,8 @@ err_rings:
  err_chardev:
  	odl_tb5_chardev_destroy(dev);
  err_free_dev:
@@ -348,7 +452,7 @@ index 350dbb3..6abe999 100644
  	ida_free(&odl_tb5_ida, dev->index);
  	kfree(dev);
  	return ret;
-@@ -206,14 +225,19 @@ static void odl_tb5_remove(struct tb_service *svc)
+@@ -206,14 +242,19 @@ static void odl_tb5_remove(struct tb_service *svc)
  	odl_tb5_dma_bufs_free(dev);
  	odl_tb5_rings_free(dev);
  
@@ -372,6 +476,46 @@ index 350dbb3..6abe999 100644
  	}
  
  	odl_tb5_chardev_destroy(dev);
+diff --git a/driver/uapi/odl_tb5_uapi.h b/driver/uapi/odl_tb5_uapi.h
+index 77eb50e..b34e893 100644
+--- a/driver/uapi/odl_tb5_uapi.h
++++ b/driver/uapi/odl_tb5_uapi.h
+@@ -62,7 +62,14 @@ typedef int64_t  __s64;
+ /* ── Stream header (5 bytes, prepended to every DMA frame) ──────────── */
+ 
+ #define ODL_TB5_STREAM_HDR_SIZE      5
+-#define ODL_TB5_STREAM_PAYLOAD_MAX   (ODL_TB5_FRAME_SIZE - ODL_TB5_STREAM_HDR_SIZE)
++/* A Thunderbolt ring frame carries framing/CRC overhead beyond the payload
++ * the driver writes, so a frame of exactly ODL_TB5_FRAME_SIZE bytes does not
++ * fit the equally-sized RX buffer and is silently dropped by the NHI. Only
++ * the short tail fragment of a multi-frame message would then arrive, so any
++ * message larger than one frame never completed reassembly. Reserve headroom
++ * so header + payload stays strictly below the buffer size. */
++#define ODL_TB5_FRAME_TAIL_RESERVE   64
++#define ODL_TB5_STREAM_PAYLOAD_MAX   (ODL_TB5_FRAME_SIZE - ODL_TB5_STREAM_HDR_SIZE - ODL_TB5_FRAME_TAIL_RESERVE)
+ 
+ #define ODL_TB5_STREAM_ID_CTRL       0
+ #define ODL_TB5_STREAM_ID_MAX        255
+diff --git a/lib/include/odl_tb5/odl_tb5_ioctl.h b/lib/include/odl_tb5/odl_tb5_ioctl.h
+index 9797875..beab7a4 100644
+--- a/lib/include/odl_tb5/odl_tb5_ioctl.h
++++ b/lib/include/odl_tb5/odl_tb5_ioctl.h
+@@ -57,7 +57,14 @@ struct odl_tb5_ring_request {
+ 
+ #define ODL_TB5_STREAM_HDR_SIZE      5
+ #define ODL_TB5_FRAME_SIZE           4096
+-#define ODL_TB5_STREAM_PAYLOAD_MAX   (ODL_TB5_FRAME_SIZE - ODL_TB5_STREAM_HDR_SIZE)
++/* A Thunderbolt ring frame carries framing/CRC overhead beyond the payload
++ * the driver writes, so a frame of exactly ODL_TB5_FRAME_SIZE bytes does not
++ * fit the equally-sized RX buffer and is silently dropped by the NHI. Only
++ * the short tail fragment of a multi-frame message would then arrive, so any
++ * message larger than one frame never completed reassembly. Reserve headroom
++ * so header + payload stays strictly below the buffer size. */
++#define ODL_TB5_FRAME_TAIL_RESERVE   64
++#define ODL_TB5_STREAM_PAYLOAD_MAX   (ODL_TB5_FRAME_SIZE - ODL_TB5_STREAM_HDR_SIZE - ODL_TB5_FRAME_TAIL_RESERVE)
+ #define ODL_TB5_STREAM_ID_CTRL       0
+ #define ODL_TB5_STREAM_ID_MAX        255
+ 
 diff --git a/verbs/CMakeLists.txt b/verbs/CMakeLists.txt
 index 0610c0e..2f1669f 100644
 --- a/verbs/CMakeLists.txt

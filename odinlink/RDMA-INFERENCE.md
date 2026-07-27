@@ -355,6 +355,68 @@ same trace shows microsecond spacing:
 [12015.724084] TX submit stream=20 dst=20 len=4     <- +4 us
 ```
 
+## BUG 20 — full-size frames silently dropped (FIXED — this was the bulk blocker)
+
+```c
+#define ODL_TB5_STREAM_PAYLOAD_MAX   (ODL_TB5_FRAME_SIZE - ODL_TB5_STREAM_HDR_SIZE)
+```
+
+A maximally-filled frame is therefore **exactly** `ODL_TB5_FRAME_SIZE` (4096) bytes. The RX
+ring buffers are the same 4096 bytes, and a Thunderbolt ring frame carries framing/CRC
+overhead beyond the payload the driver writes — so full frames do not fit and the NHI drops
+them **silently**, with no error at any layer.
+
+Only sub-maximal frames were ever delivered. That is why the link looked perfectly healthy:
+the RPC handshake's 1–16 byte messages are single frames and worked, both peers reached
+`RDMA activated`, and `ibv_devinfo` was happy. But every *multi-frame* message lost all of its
+full fragments and kept only the short tail, so reassembly never completed and the receiver
+waited forever.
+
+Captured directly — an 8496-byte message sends as `4091 + 4091 + 314`, and the peer logs only:
+
+```
+odl_tb5: RXF-BIG dst=20 src=20 plen=314 flags=0x02 stream=yes    <- the tail, nothing else
+```
+
+Both 4091-byte fragments vanished. Fix: reserve `ODL_TB5_FRAME_TAIL_RESERVE` (64 B) so
+header + payload stays strictly below the buffer size, applied to **both** the driver uapi and
+the userspace ioctl header so fragmentation matches on each side.
+
+## RESULT: OdinLink carries llama.cpp inference
+
+```
+| model            |    size | params | backend  | ngl | test |            t/s |
+| qwen35 2B Q8_0   | 1.93 GiB | 1.94 B | ROCm,RPC |  99 | pp64 | 110.10 ± 0.00 |
+| qwen35 2B Q8_0   | 1.93 GiB | 1.94 B | ROCm,RPC |  99 | tg32 |  76.22 ± 0.00 |
+```
+
+Cross-node llama.cpp inference, tensor traffic over **RDMA on the Thunderbolt cable via
+OdinLink**, `RDMA activated: qpn=20->20 mtu=4096 rx_depth=24`, exit 0.
+
+## Full bug chain
+
+Every one of these had to be fixed before a single byte of bulk payload could cross:
+
+| # | defect | effect |
+|---|---|---|
+| 11 | no discovery API; provider resolves `verbs_register_driver_34` vs rdma-core's `_59`; no kernel `ib_device` | `ibv_devices` empty — invisible to every RDMA app |
+| 13 | `ibv_post_recv` performed a blocking inline receive instead of posting a buffer | pre-posting always failed → `RDMA activate failed` |
+| 14 | `ibv_post_send` stored the caller's stack WR; `wc.wr_id` never set | worker read freed stack; completions unmatchable |
+| 15 | `modify_qp` discarded `IBV_QP_DEST_QPN` | sends addressed to `dst_id 0` |
+| 16 | `cmd_fd` assigned then overwritten with `-1` by the next init block | `poll()` always `-EBADF`; worker busy-spun |
+| 17 | `poll()` POLLOUT required a *previous* TX to have completed | 5 s per message (measured exactly 5.0 s apart) |
+| 18 | verify cleared the proof recorded when answering a peer PING | stuck in `CONNECTED`, never `READY` → every send `-EAGAIN` |
+| 19 | `ibv_poll_cq` blocked in `eventfd_read()` holding the CQ lock | self-deadlock against its own completion producer |
+| 20 | full-size frames exactly equal the RX buffer | **every multi-frame message lost all full fragments** |
+
+Plus two upstream fixes not yet merged: the TX watermark clamp from PR #20 (watermarks gate
+the frame pool, not the NHI ring, so `odl_ring_size*3/4` could never trip) and the
+`odl_busy_poll_us` RX busy-poll knob from PR #21.
+
+The fixes live on branch `strix-halo-verbs-fixes` in the OdinLink checkout and are exported as
+`patches/odinlink-verbs-and-driver-fixes.patch`.
+
+## Previous status (superseded)
 ## Where it stands now
 
 With BUG 11/13/14/15/16/17/18 fixed, OdinLink goes from *invisible to every RDMA application*
