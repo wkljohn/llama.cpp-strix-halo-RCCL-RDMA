@@ -27,10 +27,11 @@ are for *capacity*, not speed. RDMA recovers about half the cross-node penalty
 
 > **Every inference figure on this page is `-sm layer` (pipeline).** Tensor
 > parallel over RDMA — the case a 13× latency win should actually transform,
-> since it all-reduces every layer — **has not been benchmarked**. RCCL binds the
-> OdinLink plugin correctly, then the world-communicator rendezvous deadlocks
-> ([FINDINGS.md](FINDINGS.md) BUG 12). The `-sm tensor` numbers in the repo root
-> are TCP-era and predate this work.
+> since it all-reduces every layer — **has not been benchmarked**. Not because
+> anything blocks it: RCCL binds the OdinLink plugin, and `-sm tensor` runs fine
+> over TCP (27B at 3.65/4.02 t/s, in the repo root). The run pointing TP at the
+> `ODL_TB5` plugin simply has not been done yet. See
+> [REPRODUCE-RCCL.md](REPRODUCE-RCCL.md).
 
 ## Transport — byte-verified
 

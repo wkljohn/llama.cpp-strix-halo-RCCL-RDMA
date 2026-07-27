@@ -19,8 +19,8 @@ Break-even over TCP — the per-sync RPC-graph dispatch+sync overhead matches th
 this scale. The collective's own latency is ~286 µs/op (measured). The win needs a real RDMA
 floor (~30–100 µs/op); over Thunderbolt-TCP it's a wash. **That floor now exists without a NIC**
 — 22.0 µs over the Thunderbolt cable, see [../odinlink/](../odinlink/) — but `-sm tensor` has
-**not** been benchmarked over it: the world-communicator rendezvous deadlocks (BUG 12), so every
-number on this page is TCP. The value delivered here is a
+**not** been benchmarked over it. The run simply has not been made, so every number on this page
+is TCP. The value delivered here is a
 **working, correct, reproducible implementation** to measure against — and two upstream bug
 fixes that make `-sm tensor` over RPC work at all.
 
@@ -46,11 +46,12 @@ Reading it honestly:
   butterfly-vs-RCCL. Pipeline crosses the wire once per token. This matches the upstream guidance
   (cross-node = pipeline; TP = intra-node). The RCCL win is *within* the TP path, not vs pipeline.
 - The RCCL TP number is bottlenecked by the ~286us/allreduce TCP floor; a lower RDMA floor is what
-  would let TP-RCCL overtake pipeline. Measured 22.0us over Thunderbolt RDMA — but the TP run over
-  it deadlocks at rendezvous (BUG 12), so this remains untested, not disproven. On this rig, for a
-  model that FITS on one node, single-node
-  (~12.9 t/s for the 27B) still beats all cross-node options — TP's value is capacity (models too
-  big for one 96GB carve), where the +18% is the payoff.
+  would let TP-RCCL overtake pipeline. 22.0us is measured over Thunderbolt RDMA, but the TP run over
+  it has not been made — so this remains untested, not disproven. Note the 2B break-even above says
+  per-sync dispatch overhead alone roughly equals the whole butterfly cost, and RDMA does not touch
+  that, so a lower collective floor may not be sufficient. On this rig, for a model that FITS on one
+  node, single-node (~12.9 t/s for the 27B) still beats all cross-node options — TP's value is
+  capacity (models too big for one 96GB carve), where the +18% is the payoff.
 - STABILITY: the 27B world path intermittently HANGS at startup (head zombies, peer spins 100% GPU
   in the collective) — a rendezvous race to fix before this is production-usable. Re-run succeeds.
 

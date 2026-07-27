@@ -128,16 +128,31 @@ TCP. Always check.
 **Plugin binding is verified. A tensor-parallel benchmark over it is not.**
 
 RCCL selects `ODL_TB5` instead of sockets — the log block above is real output from this
-rig. What has *not* been done is a completed `-sm tensor` run over that link: the
-llama.cpp port's world-communicator rendezvous deadlocks
-([FINDINGS.md](FINDINGS.md) BUG 12), so the collective never starts.
+rig. What has *not* been done is a completed `-sm tensor` run over that link. Nothing is
+known to block it: `-sm tensor` runs over TCP (27B at 3.65/4.02 t/s, in the repo root),
+and the rendezvous deadlock that once stopped it is fixed
+([FINDINGS.md](FINDINGS.md) BUG 12). The run has simply not been made.
 
 Everything in [RESULTS.md](RESULTS.md) with a t/s figure is `-sm layer` (pipeline) over
 the RPC transport, not RCCL tensor parallel. The TP numbers in the repo root are TCP-era.
 
-This is the honest state of the most interesting case: TP all-reduces every layer, so it
-is the configuration a 13× latency improvement should transform — and it is the one that
-cannot yet be measured.
+### If you are the one to run it
+
+Go in this order — each stage isolates a different failure:
+
+1. `odl_rdma_stress --bidir` — transport is byte-clean. Skip and you cannot tell a
+   transport fault from an RCCL fault.
+2. `tests/test-world-allreduce` with `NCCL_NET_PLUGIN=ODL_TB5` — the collective alone,
+   no llama.cpp. Expect `reduced to 1.50`.
+3. 2B model, `-sm tensor`. 4. 27B.
+
+**Prove you are on RDMA at every stage.** Three separate traps above drop you onto TCP
+without an error. Watch `bond0` byte counters across a run — flat means RDMA carried it —
+and do not trust a t/s number as evidence of transport.
+
+Two open defects are likely to bite collectives specifically: teardown can hang
+(BUG 24) and `connect`/`accept` return errors where RCCL expects a retry (BUG 25). Both
+are source findings, not yet reproduced.
 
 ## Notes / known limits
 

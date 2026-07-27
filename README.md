@@ -48,7 +48,7 @@ RDMA recovers about half the cross-node penalty (8.83 → 9.16 against a 9.50 ce
 | ✅ **Beats the host butterfly** | +13–18 % on the 27B across two independent sessions. The collective is genuinely faster than GET/SET round-trips |
 | ✅ **Runs models too big for one node** | 298B hy_v3 MoE (95 GiB) tensor-parallels across both nodes at 1.78 t/s |
 | ⚠️ **RDMA discovery is an LD_PRELOAD shim** | OdinLink registers no kernel `ib_device`; anything not inheriting the preload cannot see it |
-| ❌ **RCCL over RDMA not measured** | The world-communicator rendezvous deadlocks (BUG 12) — the configuration RDMA would help *most* has no numbers yet |
+| ⬜ **RCCL over RDMA not measured** | Not blocked — `-sm tensor` runs over TCP and the old rendezvous deadlock is fixed. The run pointing TP at the RDMA plugin has not been made yet |
 
 ## Why this exists
 
@@ -59,7 +59,8 @@ world communicator spanning separate machines. Plus **two bug fixes that make
 
 Cross-node TP is latency-bound. At 286 µs/op the per-layer all-reduce dominates and
 pipeline wins outright; at ~22 µs the comm term drops ~13×, which is the regime where TP
-can plausibly overtake it. Closing that loop is what BUG 12 blocks.
+can plausibly overtake it. That measurement is the open question — see
+[odinlink/REPRODUCE-RCCL.md](odinlink/REPRODUCE-RCCL.md) for how to make it.
 
 ## Quick start — RCCL tensor parallel
 
@@ -159,13 +160,15 @@ confirmed via `NCCL_DEBUG=INFO`: `NET/Socket : Using [0]bond0:10.4.0.1`.
 Read honestly: the RCCL win is *within* the TP path, not against pipeline. Pipeline
 remains the fastest cross-node path over TCP because TP all-reduces **every** layer, and
 that per-sync cost dominates regardless of butterfly-vs-RCCL. Overtaking pipeline needs
-the RDMA floor — which is exactly why [odinlink/](odinlink/) exists, and why BUG 12
-matters.
+the RDMA floor — which is exactly why [odinlink/](odinlink/) exists, and why the
+TP-over-RDMA run is the measurement still worth making.
 
 ## Roadmap
 
-- [ ] Fix the RCCL rendezvous deadlock (BUG 12) — unblocks `-sm tensor` over RDMA, the
-      one measurement that would settle whether TP beats pipeline here.
+- [ ] **Run `-sm tensor` over the RDMA plugin** — the one measurement that would settle
+      whether TP beats pipeline here. Nothing blocks it; it just has not been done.
+- [ ] Fix teardown hang (BUG 24) and the `connect`/`accept` retry contract (BUG 25),
+      both of which collectives hit far harder than pipeline does.
 - [ ] Attribute the rare fragment drop now that sequencing detects it
       ([odinlink/FINDINGS.md](odinlink/FINDINGS.md) BUG 22), then add NAK/retry.
 - [ ] A kernel `ib_device` for OdinLink, retiring the `LD_PRELOAD` shim.

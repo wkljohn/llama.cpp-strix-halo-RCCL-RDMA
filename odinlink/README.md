@@ -41,14 +41,21 @@ Then pick your path:
 | ✅ **Byte-verified** | 21 GiB unidirectional and 2 GiB each way bidirectional, every byte checked |
 | ⚠️ **LD_PRELOAD only** | OdinLink registers no kernel `ib_device`, so discovery is a preload shim. Anything not inheriting the preload cannot see it (BUG 11) |
 | ⚠️ **Loss detected, not repaired** | Fragment sequencing makes a dropped fragment a loud error instead of silent corruption; there is no retransmit (BUG 22) |
-| ❌ **`-sm tensor` blocked** | The RCCL world-communicator rendezvous deadlocks (BUG 12), so the configuration RDMA would help *most* has no numbers yet |
+| ⬜ **`-sm tensor` untested over RDMA** | Nothing blocks it — TP runs over TCP and the old rendezvous deadlock is fixed (BUG 12). The run pointing TP at the plugin has just not been made. Two open defects may bite collectives first: BUG 24, BUG 25 |
 
 ## Why bother
 
 Cross-node tensor parallelism is latency-bound. At 286 µs/op the per-layer all-reduce
 dominates and pipeline (`-sm layer`) beats TP outright. At ~22 µs the comm term drops
 ~13×, which is the regime where TP can plausibly overtake pipeline. That is the whole
-argument for this work — and BUG 12 is what stands between it and a measurement.
+argument for this work, and it is still an argument rather than a result: the TP-over-RDMA
+run has not been made. [REPRODUCE-RCCL.md](REPRODUCE-RCCL.md) says how.
+
+Worth knowing before you assume RDMA settles it: the 2B TP result was *break-even* over
+TCP, which means per-sync dispatch overhead alone roughly equals the whole butterfly cost.
+Lowering the collective to 22 µs does not touch that overhead, so TP may still lose to
+pipeline's 8.87. The measurement is worth making precisely because the answer is not
+obvious.
 
 For `-sm layer` the win is real but modest (+3.7 %): it crosses the wire once per token,
 so ~22 µs sits against a ~110 ms/token budget. **Single node is still fastest for a model

@@ -120,9 +120,8 @@ compute TP saves. The port is correct and works, but over Thunderbolt-TCP it doe
 beat layer-split. It flips only with a real RDMA floor (~30–100 µs/op).
 
 **Update: no NIC needed.** RDMA over the existing Thunderbolt cables measures
-**22.0 µs** median — see [../odinlink/](../odinlink/). The remaining blocker is not
-hardware but the RCCL world-communicator rendezvous deadlock (BUG 12), which is why the
-`-sm tensor` + RDMA measurement does not exist yet.
+**22.0 µs** median — see [../odinlink/](../odinlink/). The `-sm tensor` + RDMA
+measurement still does not exist, but nothing blocks it; the run has not been made.
 
 Commits on `nccl-tp`: see `git log`. Related: `VLLM-TP2-STRIX-HALO.md`,
 memory `strix-halo-vllm-tensor-parallel-rccl-mod.md`.

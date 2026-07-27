@@ -29,7 +29,7 @@ Numbers live in [RESULTS.md](RESULTS.md). Recipes live in
 | 9 | *(withdrawn)* IOMMU fault blamed on upstream | was a local use-after-free | **retracted** |
 | 10 | DMA-verify handshake is an unwinnable race | second node **always** fails to reach READY | **fixed here** |
 | 11 | No discovery path at all | `ibv_devices` empty — invisible to every RDMA app | **fixed here** |
-| 12 | RCCL world-communicator rendezvous deadlock | 27B TP run hangs at startup | **open** (llama.cpp port side) |
+| 12 | RCCL world-communicator rendezvous deadlock | rank 0 blocks in `accept()` before the peer is dispatched | **fixed** (dispatch order, in the patch) |
 | 13 | `ibv_post_recv` performed a blocking receive | pre-posting always failed → `RDMA activate failed` | **fixed here** |
 | 14 | `ibv_post_send` kept the caller's stack WR | worker read freed stack; completions unmatchable | **fixed here** |
 | 15 | `modify_qp` discarded `IBV_QP_DEST_QPN` | sends addressed to `dst_id 0` | **fixed here** |
@@ -41,6 +41,8 @@ Numbers live in [RESULTS.md](RESULTS.md). Recipes live in
 | 21 | Send completed before the payload was on the wire | silent data corruption at 979 MiB/s | **fixed here** |
 | 22 | No fragment sequencing in the wire header | a dropped fragment becomes a silent short message | **fixed here** |
 | 23 | Bidirectional traffic deadlocks (three causes) | the 27B blocker | **fixed here** |
+| 24 | Destroying a stream never wakes its receive waiters | closing an RCCL comm can hang forever | **open** |
+| 25 | Plugin `connect`/`accept` return errors instead of retry | violates the RCCL v7 non-blocking contract | **open** |
 
 "Fixed here" means the patch is on the
 [`strix-halo-verbs-fixes` branch](https://github.com/wkljohn/OdinLink-Five/tree/strix-halo-verbs-fixes)
@@ -422,21 +424,43 @@ that exists every consumer needs the `LD_PRELOAD`.
 
 ---
 
-# BUG 12 — RCCL world-communicator rendezvous deadlock (OPEN)
+# BUG 12 — RCCL world-communicator rendezvous deadlock (FIXED)
 
 This one is in **this repo's llama.cpp port**, not in OdinLink.
 
-`ggml_cuda_world_init_once()` blocks in `accept()` on rank 0 during the local
-backend's allreduce, while the RPC peer only calls the same function when it
-*executes* an allreduce node. With `test-world-allreduce` the head reaches
-`world run: layers=60 iters=30`, prints `rank 0 waiting for 1 peer(s) on port 29500`,
-and hangs; the peer accepts the RPC connection, never executes the allreduce, never
-connects back. Observed: head has 0 established connections to the peer while blocked,
-peer GPU at 0 %.
+**The mechanism.** `ggml_cuda_world_init_once()` blocks in `accept()` on rank 0. Backend 0
+is the local CUDA backend, whose `graph_compute_async` runs the allreduce **inline** on the
+host thread; the RPC backends dispatch fire-and-forget. So if the local backend is
+dispatched first, rank 0 blocks in `accept()` *before* the peer's graph has been sent — the
+peer never executes an allreduce, never calls `world_init`, never connects back. Structural
+and deterministic at any world size, not a race.
 
-`docs/REPRODUCE.md` flags this as an intermittent startup hang; on the 27B here it
-reproduces every time. **This is why the RDMA `-sm tensor` numbers do not exist yet** —
-the configuration RDMA would help most is the one that cannot start.
+**The fix is in `rccl-tp-port.patch`** — `allreduce_world()` in `ggml-backend-meta.cpp`
+iterates backends high→low so the RPC ranks ship the peer its allreduce *before* the
+blocking local rank 0 runs:
+
+```c
+// Iterate high->low (n-1 .. 0) so RPC ranks go before the blocking local rank 0.
+for (size_t jj = n_backends; jj-- > 0; ) {
+    ggml_backend_graph_compute_async(backend_ctx->backend_configs[jj].backend, step_cgraphs[jj]);
+}
+```
+
+> **Correction.** Earlier revisions of this file called BUG 12 open and said it "reproduces
+> every time", and other pages here cited it as the reason no `-sm tensor` RDMA numbers
+> exist. That was wrong on both counts, and self-contradictory: this repo publishes
+> **measured** TP-over-TCP results (27B at 3.65/4.02 t/s), which could only come from
+> completed TP runs. Two independent source reviews caught it.
+>
+> **`-sm tensor` over RDMA has still never been run** — but because nobody has yet pointed a
+> TP run at the `ODL_TB5` plugin, not because anything blocks it. See
+> [REPRODUCE-RCCL.md](REPRODUCE-RCCL.md).
+
+**What remains.** `docs/REPRODUCE.md` records an *intermittent* 27B startup hang. Its cause
+is not determined from source. The likely hardening is eager world init: the exported
+`ggml_backend_cuda_world_init()` currently has **zero call sites**, so initialisation is
+lazy on first allreduce. Calling it at startup — in `rpc-server.cpp` `main`, and on the head
+when `GGML_NCCL_RANK` is set — makes both ranks arrive at the rendezvous deterministically.
 
 ---
 
@@ -705,6 +729,54 @@ two made things *worse* — the oversized reserve deadlocked TX outright, and dr
 `poll_cq` introduced the ABBA. Reliable progress came from two things only: a test that
 reproduces the real access pattern in seconds and verifies every byte, and a driver
 diagnostic that prints the failing arithmetic. Build those first.
+
+---
+
+# BUG 24 — destroying a stream never wakes its receive waiters (OPEN)
+
+**Severity: high for RCCL.** Found by two independent source reviews, not yet by a test —
+`--bidir` exercises steady-state traffic, not teardown, so nothing here reproduces it.
+
+The RCCL plugin's shutdown sets a stop flag, closes the stream, and joins the receive
+worker — the close is *meant* to make the blocked receive fail so the worker observes the
+flag. It does not. `odl_tb5_stream_destroy()` (`driver/odl_tb5_ring_dma.c:1429`) unhashes
+the stream, unlinks it from its owner, frees the ID and drops the reference — and never
+touches the wait queue:
+
+```c
+hash_del_rcu(&stream->node);
+list_del(&stream->owner_list);
+ida_free(&dev->stream_ida, stream->id);
+kref_put(&stream->refcount, odl_tb5_stream_free);
+/* no wake_up on stream->rx_waitq */
+```
+
+The **only** `wake_up` on `rx_waitq` is on data arrival (`:387`). Three waiters sleep on it
+(`:2020`, `:2057`, `:2060`). So a worker parked in `STREAM_RECV` with no inbound data sleeps
+until a signal arrives, and `pthread_join` blocks behind it — indefinitely.
+
+Consequence: every RCCL error and abort path can wedge the process rather than tearing down.
+That matters more for collectives than for ggml-rpc, because RCCL closes and reopens
+communicators far more often.
+
+**Fix:** wake the queue in `odl_tb5_stream_destroy()` (and on any close/abort path) with a
+`dying` flag included in each `wait_event_interruptible` condition, so waiters re-check and
+return `-ESHUTDOWN` instead of sleeping on a stream that no longer exists.
+
+---
+
+# BUG 25 — plugin `connect`/`accept` violate the RCCL v7 non-blocking contract (OPEN)
+
+RCCL requires `connect()`/`accept()` to return `ncclSuccess` with `*sendComm`/`*recvComm`
+set to `NULL` when the peer is not ready, so it can retry. The plugin returns an error
+instead, which RCCL surfaces as a fatal `ncclSystemError` rather than retrying.
+
+This matters exactly when the two ranks start at different times — which is the normal case
+here, since rank 1 initialises lazily inside `ggml-rpc-server`. Related: `irecv` advertises a
+single receive buffer but does not reject `n > 1`, so a multi-buffer receive would be
+silently mishandled rather than refused.
+
+Neither is yet reproduced on hardware; both are source findings.
 
 ---
 

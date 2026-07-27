@@ -161,8 +161,8 @@ advantage is latency, not bandwidth, and prompt processing is bandwidth-bound �
 pp512 is unchanged and only decode moves.
 
 The configuration that *should* benefit far more is `-sm tensor`, which all-reduces every
-layer and is crushed by the 286 µs TCP floor. That case is blocked on BUG 12, the RCCL
-rendezvous deadlock.
+layer and is crushed by the 286 µs TCP floor. That case has not been run over RDMA yet —
+see [REPRODUCE-RCCL.md](REPRODUCE-RCCL.md).
 
 And **single-node is still fastest** for a model that fits in one 96 GB carve. Two nodes
 are for capacity, not speed.
