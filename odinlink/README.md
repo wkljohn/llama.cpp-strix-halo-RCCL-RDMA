@@ -1,5 +1,30 @@
 # RDMA over Thunderbolt/USB4 on Strix Halo — OdinLink bring-up
 
+> ## ⛔ READ FIRST — paths that will crash or brick your machine
+>
+> Every item below was reproduced repeatedly on 2× Ryzen AI MAX+ 395. These are **not**
+> theoretical. Several ended in a hard freeze needing a manual power cycle, and twice the
+> **GPU failed to initialise on the following boot** (`amdgpu ... PSP firmware loading
+> failed` → `probe with driver amdgpu failed with error -22`).
+>
+> | ❌ Never do this | What happens |
+> |---|---|
+> | `rmmod odl_tb5` | NHI DMA rings stay armed → USB4 router wedges → `thunderbolt` core oopses in `tb_cfg_read`/`check_config_address` → GPU dies with it (shared firmware domain) → panic |
+> | Unbind a service to "fix" BUG 2 | **Same teardown path as rmmod.** Crashed a node with no `rmmod` involved. Use `max_devices=1` instead so the extra service never binds |
+> | Leave the module loaded while the handshake fails | The login retry loop **never gives up**. Hammering a wedged router ends in `amdgpu_irq_put` / `drm_buddy_fini` → `BUG: kernel NULL pointer dereference` → freeze. Use `login_max_retries` |
+> | Reload the whole TB stack repeatedly | Wedges the USB4 controller *and* the GPU PSP. Recovery needs a **full power cycle**, not a warm reboot |
+>
+> **Safe operating rules**
+> 1. **Load `odl_tb5` exactly once per boot. Never unload it.** To test a new build, reboot first.
+> 2. **One cable, or `max_devices=1`.** With two cables both services sit at `route=2` (BUG 2) and the handshake cannot complete — and the unbind workaround is itself unsafe.
+> 3. **Bound the retries**: `login_max_retries=20` (default in the patched driver).
+> 4. **Keep a non-Thunderbolt path (LAN/Wi-Fi) to every node.** You will need it.
+> 5. If a boot logs `PSP firmware loading failed`, **power off fully** — a warm reboot will not clear it.
+>
+> The patched driver in this repo adds `max_devices`, `only_domain` and `login_max_retries`
+> precisely so none of the dangerous manual steps are needed. See
+> [FINDINGS.md](FINDINGS.md) for root causes and patches.
+
 The RCCL port in this repo is **transport-agnostic**: it calls `ncclAllReduce`, and RCCL picks
 the wire. Over TCP that wire costs **286 µs/op**, which is what keeps cross-node tensor
 parallelism behind pipeline. This directory covers replacing that wire with **RDMA over the
@@ -59,11 +84,10 @@ nm -D --defined-only build/rccl/librccl_net_odl_tb5.so | grep NetPlugin
 Use [`scripts/odl-bringup.sh`](scripts/odl-bringup.sh), or by hand:
 
 ```bash
-sudo insmod driver/odl_tb5.ko e2e=0
-# With 2 cables, both services land on route=2 and the handshake never completes (BUG 2).
-# Bind exactly one:
-for s in $(ls /sys/bus/thunderbolt/drivers/odl_tb5/ | grep '^1-'); do
-  echo $s | sudo tee /sys/bus/thunderbolt/drivers/odl_tb5/unbind >/dev/null; done
+# With 2 cables both services land on route=2 and the handshake never completes (BUG 2).
+# Bind exactly one -- via the module parameter, NOT by unbinding afterwards
+# (unbinding runs the same unsafe teardown path as rmmod; see the warning above):
+sudo insmod driver/odl_tb5.ko e2e=0 max_devices=1 login_max_retries=20
 ```
 
 Both nodes must reach READY — this is the only success signal that matters:
@@ -111,11 +135,12 @@ That silent fallback is the single easiest way to "measure RDMA" and actually be
 
 ## Gotchas that cost real time
 
-- **One `insmod` per boot.** The driver leaks XDomain hop-IDs on unload/re-probe; the second
-  load fails `enable_paths failed (-12)` (ENOMEM). **No reboot needed** — reload the whole
-  stack: `rmmod odl_tb5 thunderbolt_net thunderbolt && modprobe thunderbolt thunderbolt_net`.
-  See FINDINGS.md BUG 1 for the patch.
-- **That stack reload disturbs your IP bond**, which shares the same cables:
+- **One `insmod` per boot — and never unload.** Unpatched, the driver leaks XDomain hop-IDs on
+  unload/re-probe and the second load fails `enable_paths failed (-12)` (ENOMEM). The obvious
+  workaround (reloading the whole TB stack) **is unsafe — see the warning at the top**; it
+  wedged the USB4 controller and the GPU here. Apply the BUG 1 patches instead so you never
+  need to reload, and **reboot** if you must load a different build.
+- **If you ever do reload the stack, it disturbs your IP bond**, which shares the same cables:
   - flush stale ARP: `sudo ip neigh flush dev bond0`
   - a slave can show `carrier=1 operstate=up` and carry **zero** traffic; `balance-rr` keeps
     striping onto it → ~50–66 % loss that looks like "the peer is down". Find it with
