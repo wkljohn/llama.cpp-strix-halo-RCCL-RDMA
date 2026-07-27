@@ -20,10 +20,13 @@ of ~120 per-op round-trips. Built and tested on 2× AMD Strix Halo (gfx1151) ove
 - **RDMA-ready, no code change** — the collective is transport-agnostic; RCCL auto-selects IB verbs when a
   NIC is present.
 
-**⏳ The RDMA test is pending hardware — and it's the headline number, not a footnote.** Over TCP the
-per-layer sync cost (286 µs/op) is what keeps TP from beating pipeline; RDMA drops that to **~5 µs/op**
-(~50×), which is what should tip TP-RCCL *past* pipeline. So the TCP results below **prove correctness and
-the collective win — they are the pre-RDMA baseline, not the ceiling.** The ceiling is a $-few NIC away.
+**⚡ RDMA is no longer hypothetical — measured at 22.4 µs on the existing Thunderbolt cables.**
+Over TCP the per-layer sync costs **286 µs/op**, which is what keeps TP behind pipeline. Using
+[OdinLink](https://github.com/Geramy/OdinLink-Five) for RDMA-over-Thunderbolt the same round trip
+measures **22.42 µs median (13.6 min, 4.0 jitter) — ~13× lower**, with **no new NIC**.
+So the TCP numbers below are the **pre-RDMA baseline, not the ceiling**.
+See **[odinlink/](odinlink/)** for the full bring-up guide, measurements, and the 8 upstream bugs
+(with patches) found getting there.
 
 ## Why this exists (the differentiator)
 
