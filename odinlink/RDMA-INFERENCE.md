@@ -28,7 +28,7 @@ Two candidates exist on this hardware. **Only one currently works with llama.cpp
 | stack | kernel `ib_device`? | rdma-core ABI | works with llama.cpp RPC? |
 |---|---|---|---|
 | [`thunderbolt-ibverbs`](https://github.com/) 0.3.4 (DKMS) | ✅ yes (`usb4_rdma0`) | v59 (matches rdma-core 61) | ✅ **yes** |
-| [OdinLink-Five](https://github.com/Geramy/OdinLink-Five) | ❌ no — char dev only (`/dev/odl_tb5_0`) | v34 (stale) | ❌ no — see BUG 11 |
+| [OdinLink-Five](https://github.com/Geramy/OdinLink-Five) | ❌ no — char dev only (`/dev/odl_tb5_0`) | v34 (stale) | ⚠️ **partly — discovery + QP activation now work, data path still stalls** (BUG 11/13/14) |
 
 llama.cpp's RDMA transport (`ggml/src/ggml-rpc/transport.cpp`, `GGML_RPC_RDMA=ON`) discovers
 devices the standard way — `ibv_get_device_list()` → `ibv_get_device_name()` →
@@ -206,3 +206,103 @@ this as an intermittent startup hang; here it reproduces every time.
   dependency conflicts.
 - The RPC server must be started with `exec` over ssh in a held session; backgrounded/orphaned
   it dies silently.
+
+
+---
+
+# Making OdinLink itself carry the traffic — progress and remaining gap
+
+`patches/odinlink-verbs-and-driver-fixes.patch` (apply to a clean
+[OdinLink-Five](https://github.com/Geramy/OdinLink-Five) checkout) takes OdinLink from
+"completely invisible to every RDMA application" to "discovered, opened, and QP activated by
+llama.cpp on both nodes":
+
+```
+RDMA probed:    dev=odl_tb5_0 gid=0 RoCEv2 qpn=20 inline=256
+RDMA activated: qpn=20->20 mtu=4096 rx_depth=24        <- on BOTH nodes
+```
+
+**It does not yet complete a benchmark** — after activation the first payload exchange stalls
+and the run times out. What follows is what was fixed and what is left, so the remaining work
+is a short list rather than a rediscovery exercise.
+
+## BUG 11 — no discovery path (FIXED here)
+
+Covered above: the rdma-core provider resolves `verbs_register_driver_34` against an
+rdma-core that only exports `_59`, and no kernel `ib_device` exists to enumerate anyway.
+
+Rather than add a kernel uverbs device, the fix supplies the discovery half of the API in the
+existing LD_PRELOAD shim — new file `verbs/src/odl_tb5_verbs_discovery.c`:
+
+- `ibv_get_device_list` / `ibv_free_device_list` / `ibv_get_device_name` — advertise
+  `odl_tb5_N` alongside (not instead of) any real adapters, which are forwarded to the real
+  libibverbs so a Mellanox card in the same box keeps working.
+- `ibv_query_gid` **and** `_ibv_query_gid_ex` — synthesise a RoCE v2 GID as the IPv4-mapped
+  form of the local address (`::ffff:a.b.c.d`, from `ODL_RDMA_GID_IFACE`, default `bond0`),
+  which is what consumers match against their TCP address. Both forms must be interposed:
+  `ibv_query_gid_ex` is `static inline` and forwards to the exported `_ibv_query_gid_ex`,
+  while the plain `ibv_query_gid` is called separately by `rdma_probe()` — and the real
+  libibverbs implementation **segfaults** on an OdinLink context, since it walks
+  provider-private state that does not exist.
+
+The data-path verbs (`ibv_post_send`, `ibv_poll_cq`) are `static inline` and dispatch through
+`context->ops`, which `odl_init_context_ops()` already fills — so those need no interposer.
+
+`ibv_devices` now lists `odl_tb5_0` on both nodes.
+
+## BUG 13 — `ibv_post_recv` had inverted semantics (FIXED here)
+
+`odl_post_recv()` did not post a buffer; it **performed a receive inline**, blocking in
+`poll(fd, 5000)` and returning `-ETIMEDOUT`/`-EAGAIN` when no data had arrived:
+
+```c
+int pr = poll(&pfd, 1, 5000);
+if (pr <= 0 || !(pfd.revents & POLLIN)) { *bad_wr = wr; return pr == 0 ? -ETIMEDOUT : -EAGAIN; }
+```
+
+Every verbs consumer **pre-posts** receive buffers before any traffic exists — llama.cpp posts
+`RDMA_RX_DEPTH` (24) of them between the INIT and RTR transitions, and RCCL/perftest do the
+same. So the first post always failed and setup aborted with `RDMA activate failed, staying on
+TCP`. This is a design-level incompatibility, not a tuning issue.
+
+Fix: a real receive queue. `post_recv` copies the WR into a ring and returns immediately; the
+existing QP worker thread drains inbound stream data into posted buffers and posts the
+completions (`odl_rq_drain()`).
+
+## BUG 14 — send path stored pointers to caller stack memory (FIXED here)
+
+`odl_post_send()` stored the caller's `struct ibv_send_wr *` in `qp->sq[]` and the worker
+thread dereferenced it later. Callers legitimately use stack storage —
+
+```c
+struct ibv_sge sge = {};
+struct ibv_send_wr wr = {}, * bad = nullptr;
+...
+if (ibv_post_send(c->qp, &wr, &bad) != 0) return false;   // wr dies at scope exit
+```
+
+— because `ibv_post_send` is defined to consume the WR before returning. The worker was
+therefore reading freed stack frames. Fix: copy `wr_id`/`addr`/`length`/`lkey`/`num_sge` at
+post time. The same commit sets `wc.wr_id` on send completions, which was never populated —
+consumers that match completions by `wr_id` (llama.cpp uses the chunk sequence number) could
+not have worked.
+
+## What is still broken
+
+After `RDMA activated` on both nodes the first payload exchange does not complete: the head
+blocks and the run times out, while the driver shows the stream created and torn down
+(`odl_tb5: stream 20 created` / `destroying`). Both peers independently chose stream id 20, so
+that coincidence has not been ruled out as load-bearing. Suspects, in order:
+
+1. **Stream addressing.** `odl_tb5_stream_send(h, stream_id, 0, ...)` sends to peer id `0`;
+   whether the remote side's stream 20 is the intended sink is unverified. A QP pair needs an
+   explicit local↔remote stream binding negotiated at `modify_qp(RTR)` time, using the
+   `dest_qp_num` the consumer supplies — which `odl_modify_qp()` currently ignores entirely
+   (it accepts every transition and stores only `qp_state`).
+2. **RX drain scheduling.** `odl_rq_drain()` currently runs only on the worker's idle path, so
+   a QP with continuous send traffic may starve receives.
+3. **Flow control / chunking.** llama.cpp sends 256 KiB chunks with `RDMA_TX_DEPTH=2` in
+   flight; OdinLink's frame pool and E2E credits may need explicit backpressure rather than
+   `-EAGAIN` re-queueing.
+
+Item 1 is the most likely culprit and the natural next step.

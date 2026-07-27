@@ -1,0 +1,830 @@
+diff --git a/driver/odl_tb5_core.h b/driver/odl_tb5_core.h
+index 40670d0..283035d 100644
+--- a/driver/odl_tb5_core.h
++++ b/driver/odl_tb5_core.h
+@@ -245,6 +245,11 @@ struct odl_tb5_device {
+ 	bool			login_sent;
+ 	bool			login_received;
+ 	int			stale_remote_tx_hopid;
++	/* BUG1 fix: authoritative record of the hop-ID actually allocated by
++	 * tb_xdomain_alloc_in_hopid(), so every teardown path can release it
++	 * regardless of connection state. */
++	bool			in_hopid_valid;
++	int			in_hopid;
+ 
+ 	/* DMA verification (ping/pong) */
+ 	struct work_struct	verify_work;
+diff --git a/driver/odl_tb5_proto.c b/driver/odl_tb5_proto.c
+index 1c1bc38..e524730 100644
+--- a/driver/odl_tb5_proto.c
++++ b/driver/odl_tb5_proto.c
+@@ -27,6 +27,13 @@
+ #define ODL_TB5_MSG_LOGOUT     3
+ 
+ #define ODL_TB5_LOGIN_TIMEOUT  500
++
++/* Stop retrying the XDomain login after this many failures (0 = forever).
++ * See HAZARD note in odl_tb5_login_work_fn(). */
++int odl_login_max_retries = 20;
++module_param_named(login_max_retries, odl_login_max_retries, int, 0644);
++MODULE_PARM_DESC(login_max_retries,
++	"Give up XDomain login after N failures (0 = retry forever; default 20)");
+ #define ODL_TB5_ENABLE_RETRIES 5
+ #define ODL_TB5_ENABLE_DELAY   200
+ 
+@@ -290,15 +297,32 @@ static int odl_tb5_complete_connection(struct odl_tb5_device *dev)
+ {
+ 	int ret, i;
+ 
++	/* BUG1 fix (re-entry): this function is called again on every handshake
++	 * restart.  Without releasing the hop-ID we already hold, each retry
++	 * orphans the previous allocation (dev->in_hopid is simply overwritten)
++	 * until tb_xdomain_enable_paths() fails with -ENOMEM.  Release first. */
++	if (dev->in_hopid_valid) {
++		if (dev->tx.started)
++			tb_xdomain_disable_paths(dev->xd, dev->local_tx_hopid,
++						 dev->tx.ring ? dev->tx.ring->hop : -1,
++						 dev->in_hopid,
++						 dev->rx.ring ? dev->rx.ring->hop : -1);
++		tb_xdomain_release_in_hopid(dev->xd, dev->in_hopid);
++		dev->in_hopid_valid = false;
++	}
++
+ 	ret = tb_xdomain_alloc_in_hopid(dev->xd, dev->remote_tx_hopid);
+ 	if (ret < 0) {
+ 		pr_err("OdinLink: failed to allocate input HopID: %d\n", ret);
+ 		return ret;
+ 	}
++	dev->in_hopid = dev->remote_tx_hopid;
++	dev->in_hopid_valid = true;
+ 	ret = odl_tb5_rings_start(dev);
+ 	if (ret) {
+ 		pr_err("OdinLink: failed to start rings: %d\n", ret);
+-		tb_xdomain_release_in_hopid(dev->xd, dev->remote_tx_hopid);
++		tb_xdomain_release_in_hopid(dev->xd, dev->in_hopid);
++		dev->in_hopid_valid = false;
+ 		return ret;
+ 	}
+ 
+@@ -309,8 +333,8 @@ static int odl_tb5_complete_connection(struct odl_tb5_device *dev)
+ 		if (ret) {
+ 			pr_err("OdinLink: failed to prime RX: %d\n", ret);
+ 			odl_tb5_rings_stop(dev);
+-			tb_xdomain_release_in_hopid(dev->xd,
+-						    dev->remote_tx_hopid);
++			tb_xdomain_release_in_hopid(dev->xd, dev->in_hopid);
++			dev->in_hopid_valid = false;
+ 			return ret;
+ 		}
+ 		pr_info("OdinLink: RX primed with 16 frames before "
+@@ -340,7 +364,8 @@ static int odl_tb5_complete_connection(struct odl_tb5_device *dev)
+ 		       "after %d attempts: %d\n",
+ 		       ODL_TB5_ENABLE_RETRIES, ret);
+ 		odl_tb5_rings_stop(dev);
+-		tb_xdomain_release_in_hopid(dev->xd, dev->remote_tx_hopid);
++		tb_xdomain_release_in_hopid(dev->xd, dev->in_hopid);
++		dev->in_hopid_valid = false;
+ 		return ret;
+ 	}
+ 
+@@ -464,8 +489,24 @@ static void odl_tb5_ctrl_reply_work_fn(struct work_struct *work)
+ 	int type = dev->verify_rx_type;
+ 
+ 	if (type == ODL_TB5_DMA_PING) {
++		int ret;
++
+ 		pr_info("OdinLink: DMA ping received, sending pong\n");
+-		odl_tb5_send_dma_msg(dev, ODL_TB5_DMA_PONG);
++		ret = odl_tb5_send_dma_msg(dev, ODL_TB5_DMA_PONG);
++
++		/* BUG 10 fix: answering a PING is itself proof the DMA path
++		 * works in both directions -- we received a frame (RX good)
++		 * and submitted one (TX good).  Without this the handshake is
++		 * an unwinnable race: the peer that verifies first calls
++		 * odl_tb5_rings_reset() and sets rx_target/rx_posted to 0
++		 * (no RX frames are posted until a STREAM_OPEN ioctl), so our
++		 * PINGs land nowhere and our own PONG never arrives.  The
++		 * second node then always fails "DMA verify failed after 300
++		 * attempts" even though the link is perfectly healthy. */
++		if (!ret && !dev->pong_received) {
++			dev->pong_received = true;
++			wake_up_all(&dev->verify_waitq);
++		}
+ 	} else {
+ 		pr_warn("OdinLink: unexpected DMA ctrl message type %d\n",
+ 			type);
+@@ -604,8 +645,10 @@ static void odl_tb5_restart_work_fn(struct work_struct *work)
+ 					 dev->stale_remote_tx_hopid,
+ 					 dev->rx.ring->hop);
+ 		odl_tb5_rings_stop(dev);
+-		tb_xdomain_release_in_hopid(dev->xd,
+-					    dev->stale_remote_tx_hopid);
++		if (dev->in_hopid_valid) {
++			tb_xdomain_release_in_hopid(dev->xd, dev->in_hopid);
++			dev->in_hopid_valid = false;
++		}
+ 	}
+ 
+ 	mutex_lock(&dev->state_lock);
+@@ -642,6 +685,21 @@ static void odl_tb5_login_work_fn(struct work_struct *work)
+ 				"retrying in %lu ms\n",
+ 				dev->login_retries, ret, delay_ms);
+ 
++		/* HAZARD FIX: bound the retry storm.  Retrying forever hammers
++		 * tb_cfg_read() against a router that may already be wedged;
++		 * observed to take down the USB4 controller and (shared power/
++		 * firmware domain on Strix Halo) the GPU with it, ending in
++		 * amdgpu_irq_put/drm_buddy_fini NULL-deref and a hard freeze.
++		 * Give up and stay quiescent instead. */
++		if (odl_login_max_retries > 0 &&
++		    dev->login_retries >= odl_login_max_retries) {
++			pr_warn("OdinLink: giving up after %d login attempts "
++				"(last err %d); staying idle.  Check the peer "
++				"is up and only ONE service is bound.\n",
++				dev->login_retries, ret);
++			return;
++		}
++
+ 		schedule_delayed_work(&dev->login_work,
+ 				      msecs_to_jiffies(delay_ms));
+ 	}
+diff --git a/driver/odl_tb5_ring_dma.c b/driver/odl_tb5_ring_dma.c
+index aaae32d..2162b34 100644
+--- a/driver/odl_tb5_ring_dma.c
++++ b/driver/odl_tb5_ring_dma.c
+@@ -1344,14 +1344,17 @@ struct odl_tb5_stream *odl_tb5_stream_create(struct odl_tb5_device *dev,
+ 	INIT_LIST_HEAD(&stream->rx_queue);
+ 	spin_lock_init(&stream->rx_lock);
+ 	stream->rx_queue_len = 0;
+-	stream->rx_queue_max = 256;
++	stream->rx_queue_max = 65536;   /* was 256: a single ~1MB msg = ~264 frames;
++					 * under load the sender runs >256 frames ahead
++					 * and the old cap silently DROPPED frames ->
++					 * plugin framing desync -> vLLM hang. */
+ 	atomic_set(&stream->rx_complete, 0);
+ 	init_waitqueue_head(&stream->rx_waitq);
+ 
+ 	kref_init(&stream->refcount);
+ 
+ 	mutex_lock(&dev->stream_lock);
+-	hash_add(dev->streams, &stream->node, stream->id);
++	hash_add_rcu(dev->streams, &stream->node, stream->id);
+ 	mutex_unlock(&dev->stream_lock);
+ 
+ 	if (owner) {
+@@ -1427,9 +1430,12 @@ struct odl_tb5_stream *odl_tb5_stream_lookup(struct odl_tb5_device *dev,
+ 	struct odl_tb5_stream *stream;
+ 
+ 	rcu_read_lock();
+-	hash_for_each_possible(dev->streams, stream, node, stream_id) {
++	hash_for_each_possible_rcu(dev->streams, stream, node, stream_id) {
+ 		if (stream->id == stream_id) {
+-			kref_get(&stream->refcount);
++			/* Stream may be concurrently freed (hash_del_rcu in
++			 * stream_destroy); only take a ref if still alive. */
++			if (!kref_get_unless_zero(&stream->refcount))
++				break;
+ 			rcu_read_unlock();
+ 			return stream;
+ 		}
+diff --git a/driver/odl_tb5_service.c b/driver/odl_tb5_service.c
+index 350dbb3..6abe999 100644
+--- a/driver/odl_tb5_service.c
++++ b/driver/odl_tb5_service.c
+@@ -38,6 +38,16 @@ MODULE_PARM_DESC(protocol,
+ 
+ bool odl_e2e = true;
+ module_param_named(e2e, odl_e2e, bool, 0444);
++
++/* Bind at most N XDomain services (0 = unlimited).  With two Thunderbolt
++ * cables both peer services sit at route=2 (BUG 2) and the handshake cannot
++ * complete; unbinding one afterwards runs the full teardown path, so bind
++ * only one from the start instead. */
++int odl_max_devices = 0;
++module_param_named(max_devices, odl_max_devices, int, 0444);
++MODULE_PARM_DESC(max_devices,
++	"Bind at most N XDomain services (0 = unlimited; use 1 with two cables)");
++static atomic_t odl_bound_count = ATOMIC_INIT(0);
+ MODULE_PARM_DESC(e2e,
+ 	"Enable end-to-end flow control (default=1). Set 0 for TB3 controllers "
+ 	"that do not support RING_FLAG_E2E.");
+@@ -62,6 +72,13 @@ MODULE_DEVICE_TABLE(tbsvc, odl_tb5_ids);
+ static int odl_tb5_probe(struct tb_service *svc,
+ 			 const struct tb_service_id *id)
+ {
++	if (odl_max_devices > 0 &&
++	    atomic_inc_return(&odl_bound_count) > odl_max_devices) {
++		atomic_dec(&odl_bound_count);
++		pr_info("odl_tb5: max_devices=%d reached, skipping service\n",
++			odl_max_devices);
++		return -ENODEV;
++	}
+ 	struct odl_tb5_device *dev;
+ 	int ret;
+ 
+@@ -156,6 +173,8 @@ err_rings:
+ err_chardev:
+ 	odl_tb5_chardev_destroy(dev);
+ err_free_dev:
++	if (odl_max_devices > 0)
++		atomic_dec(&odl_bound_count);
+ 	ida_free(&odl_tb5_ida, dev->index);
+ 	kfree(dev);
+ 	return ret;
+@@ -206,14 +225,19 @@ static void odl_tb5_remove(struct tb_service *svc)
+ 	odl_tb5_dma_bufs_free(dev);
+ 	odl_tb5_rings_free(dev);
+ 
+-	if (saved_state == ODL_TB5_STATE_CONNECTED ||
+-	    saved_state == ODL_TB5_STATE_READY) {
++	/* BUG1 fix: release regardless of connection state.  The original code
++	 * released only from CONNECTED/READY, so removal during HANDSHAKE
++	 * (login retrying, peer gone, admin unbind) leaked the hop-ID until
++	 * enable_paths returned -ENOMEM on every later load.  Ordering is kept
++	 * exactly as upstream: this runs AFTER rings_stop()/bufs_free() above. */
++	if (dev->in_hopid_valid) {
+ 		tb_xdomain_disable_paths(dev->xd,
+ 					 dev->local_tx_hopid,
+ 					 dev->tx.ring ? dev->tx.ring->hop : -1,
+-					 dev->remote_tx_hopid,
++					 dev->in_hopid,
+ 					 dev->rx.ring ? dev->rx.ring->hop : -1);
+-		tb_xdomain_release_in_hopid(dev->xd, dev->remote_tx_hopid);
++		tb_xdomain_release_in_hopid(dev->xd, dev->in_hopid);
++		dev->in_hopid_valid = false;
+ 	}
+ 
+ 	odl_tb5_chardev_destroy(dev);
+diff --git a/verbs/CMakeLists.txt b/verbs/CMakeLists.txt
+index 0610c0e..2f1669f 100644
+--- a/verbs/CMakeLists.txt
++++ b/verbs/CMakeLists.txt
+@@ -50,6 +50,7 @@ set(VERBS_LIBS
+ 
+ add_library(odl_tb5_verbs SHARED
+     ${VERBS_CORE_SOURCES}
++    src/odl_tb5_verbs_discovery.c
+     src/odl_tb5_verbs_main.c
+ )
+ 
+diff --git a/verbs/src/odl_tb5_verbs.h b/verbs/src/odl_tb5_verbs.h
+index ca73a50..13d74d2 100644
+--- a/verbs/src/odl_tb5_verbs.h
++++ b/verbs/src/odl_tb5_verbs.h
+@@ -64,6 +64,7 @@
+ #define ODL_VERBS_MAX_MRS               512
+ #define ODL_VERBS_MAX_QPS               256
+ #define ODL_VERBS_MAX_CQS               128
++#define ODL_VERBS_RQ_DEPTH              256
+ #define ODL_VERBS_COMP_CHANNEL_BACKLOG   64
+ #define ODL_VERBS_SQ_DEPTH              64
+ 
+@@ -139,7 +140,14 @@ struct odl_verbs_qp {
+ 
+     /* Work submission queue (async via worker thread) */
+     pthread_mutex_t           sq_lock;
+-    struct ibv_send_wr       *sq[ODL_VERBS_SQ_DEPTH];
++    /* BUG14: callers pass stack-allocated ibv_send_wr/ibv_sge and expect
++     * post_send to return immediately, so the worker must never dereference
++     * the caller's pointers. Store copies of the fields we need. */
++    uint64_t                  sq_wr_id[ODL_VERBS_SQ_DEPTH];
++    uint64_t                  sq_addr[ODL_VERBS_SQ_DEPTH];
++    uint32_t                  sq_len[ODL_VERBS_SQ_DEPTH];
++    uint32_t                  sq_lkey[ODL_VERBS_SQ_DEPTH];
++    int                       sq_num_sge[ODL_VERBS_SQ_DEPTH];
+     int                       sq_head;
+     int                       sq_tail;
+     int                       sq_count;
+@@ -148,6 +156,19 @@ struct odl_verbs_qp {
+     pthread_t                 worker;
+     bool                      worker_running;
+ 
++    /* Receive queue: buffers posted by the app, awaiting inbound data.
++     * ibv_post_recv() must NOT block or touch the wire -- it only enqueues.
++     * The worker thread drains the stream into these buffers and posts the
++     * completions. Callers pass stack-allocated ibv_recv_wr/ibv_sge, so we
++     * store COPIES, never the caller's pointers. */
++    pthread_mutex_t           rq_lock;
++    uint64_t                  rq_wr_id[ODL_VERBS_RQ_DEPTH];
++    uint64_t                  rq_addr[ODL_VERBS_RQ_DEPTH];
++    uint32_t                  rq_len[ODL_VERBS_RQ_DEPTH];
++    int                       rq_head;
++    int                       rq_tail;
++    int                       rq_count;
++
+     /* Async tracking */
+     atomic_int                pending_sends;
+     atomic_int                pending_recvs;
+@@ -251,6 +272,7 @@ int odl_modify_qp(struct ibv_qp *, struct ibv_qp_attr *, int);
+ int odl_query_qp(struct ibv_qp *, struct ibv_qp_attr *, int, struct ibv_qp_init_attr *);
+ int odl_post_send(struct ibv_qp *, struct ibv_send_wr *, struct ibv_send_wr **);
+ int odl_post_recv(struct ibv_qp *, struct ibv_recv_wr *, struct ibv_recv_wr **);
++int odl_rq_drain(struct odl_verbs_qp *oqp);
+ 
+ /* Ops table init */
+ void odl_init_context_ops(struct ibv_context *ctx);
+diff --git a/verbs/src/odl_tb5_verbs_discovery.c b/verbs/src/odl_tb5_verbs_discovery.c
+new file mode 100644
+index 0000000..19826b9
+--- /dev/null
++++ b/verbs/src/odl_tb5_verbs_discovery.c
+@@ -0,0 +1,218 @@
++/*
++ * OdinLink — Verbs: device discovery interposer
++ *
++ * The shim already implements open_device/query_port/create_qp/post_send/
++ * poll_cq, and odl_init_context_ops() fills the context ops table that the
++ * static-inline data-path verbs (ibv_post_send, ibv_poll_cq) dispatch
++ * through. What was missing is *discovery*: every rdma-core consumer
++ * (llama.cpp's ggml-rpc RDMA transport, RCCL's IB transport, perftest)
++ * starts with
++ *
++ *     ibv_get_device_list() -> ibv_get_device_name() -> ibv_open_device()
++ *     -> ibv_query_port() -> ibv_query_gid_ex()   (match GID to local IP)
++ *
++ * and none of ibv_get_device_list / ibv_free_device_list /
++ * ibv_get_device_name / _ibv_query_gid_ex were exported, so OdinLink was
++ * invisible: ibv_devices printed nothing and applications fell back to TCP.
++ *
++ * Those four are real (non-inline) exported symbols in libibverbs, so an
++ * LD_PRELOAD interposer can supply them. Non-OdinLink devices are forwarded
++ * to the real libibverbs so a Mellanox/rxe card in the same box keeps working.
++ *
++ * Usage:
++ *     LD_PRELOAD=libodl_tb5_verbs.so \
++ *     ODL_RDMA_GID_IFACE=bond0 \
++ *     ./ggml-rpc-server ...
++ */
++
++#define _GNU_SOURCE
++#include <dlfcn.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <stdbool.h>
++#include <arpa/inet.h>
++#include <ifaddrs.h>
++#include <netinet/in.h>
++#include <sys/socket.h>
++#include <infiniband/verbs.h>
++
++#include <errno.h>
++
++#include "odl_tb5_verbs.h"
++#include "odl_tb5_verbs_wrapper.h"
++
++/* ── real libibverbs entry points (for non-OdinLink devices) ─────────── */
++
++static struct ibv_device **(*real_get_device_list)(int *);
++static void               (*real_free_device_list)(struct ibv_device **);
++static const char        *(*real_get_device_name)(struct ibv_device *);
++static int                (*real_query_gid)(struct ibv_context *, uint8_t, int,
++                                             union ibv_gid *);
++static int                (*real_query_gid_ex)(struct ibv_context *, uint32_t,
++                                               uint32_t, struct ibv_gid_entry *,
++                                               uint32_t, size_t);
++
++static void odl_resolve_real(void)
++{
++    static bool done = false;
++    if (done) return;
++    done = true;
++    real_get_device_list  = dlsym(RTLD_NEXT, "ibv_get_device_list");
++    real_free_device_list = dlsym(RTLD_NEXT, "ibv_free_device_list");
++    real_get_device_name  = dlsym(RTLD_NEXT, "ibv_get_device_name");
++    /* ibv_query_gid_ex() is static inline in verbs.h and forwards here. */
++    real_query_gid        = dlsym(RTLD_NEXT, "ibv_query_gid");
++    real_query_gid_ex     = dlsym(RTLD_NEXT, "_ibv_query_gid_ex");
++}
++
++/* ── local IPv4, used to synthesise a RoCE v2 GID ────────────────────── */
++
++/*
++ * Consumers match a GID against the address they bound their TCP socket to.
++ * A RoCE v2 GID for IPv4 is the IPv4-mapped IPv6 form: ::ffff:a.b.c.d.
++ * Pick the address of the interface carrying the Thunderbolt traffic
++ * (ODL_RDMA_GID_IFACE, default bond0), or take it verbatim from
++ * ODL_RDMA_GID_IP.
++ */
++static bool odl_local_ipv4(struct in_addr *out)
++{
++    const char *ip_env = getenv("ODL_RDMA_GID_IP");
++    if (ip_env && inet_pton(AF_INET, ip_env, out) == 1)
++        return true;
++
++    const char *want = getenv("ODL_RDMA_GID_IFACE");
++    if (!want) want = "bond0";
++
++    struct ifaddrs *ifa = NULL;
++    if (getifaddrs(&ifa) != 0) return false;
++
++    bool found = false;
++    for (struct ifaddrs *p = ifa; p; p = p->ifa_next) {
++        if (!p->ifa_addr || p->ifa_addr->sa_family != AF_INET) continue;
++        if (strcmp(p->ifa_name, want) != 0) continue;
++        *out = ((struct sockaddr_in *)p->ifa_addr)->sin_addr;
++        found = true;
++        break;
++    }
++    freeifaddrs(ifa);
++    return found;
++}
++
++static void odl_make_roce_v2_gid(union ibv_gid *gid)
++{
++    struct in_addr a;
++    memset(gid, 0, sizeof(*gid));
++    if (!odl_local_ipv4(&a)) return;
++    /* ::ffff:a.b.c.d  */
++    gid->raw[10] = 0xff;
++    gid->raw[11] = 0xff;
++    memcpy(&gid->raw[12], &a.s_addr, 4);
++}
++
++/* ── ibv_get_device_list / free / name ───────────────────────────────── */
++
++struct ibv_device **ibv_get_device_list(int *num_devices)
++{
++    odl_resolve_real();
++
++    int n_odl = odl_num_tb5_devices();
++
++    int n_real = 0;
++    struct ibv_device **real_list = NULL;
++    if (real_get_device_list)
++        real_list = real_get_device_list(&n_real);
++    if (n_real < 0) n_real = 0;
++
++    struct ibv_device **out = calloc((size_t)n_odl + n_real + 1,
++                                     sizeof(*out));
++    if (!out) {
++        if (real_list && real_free_device_list) real_free_device_list(real_list);
++        if (num_devices) *num_devices = 0;
++        return NULL;
++    }
++
++    int k = 0;
++    for (int i = 0; i < n_odl; i++) {
++        struct ibv_device *d = odl_find_tb5_device(i);
++        if (d) out[k++] = d;
++    }
++    for (int i = 0; i < n_real; i++)
++        out[k++] = real_list[i];
++    out[k] = NULL;
++
++    /*
++     * The real list's backing array is no longer needed — the ibv_device
++     * pointers inside it stay valid (libibverbs owns them for process
++     * lifetime), so it is safe to release the array itself here.
++     */
++    if (real_list && real_free_device_list)
++        real_free_device_list(real_list);
++
++    if (num_devices) *num_devices = k;
++    return out;
++}
++
++void ibv_free_device_list(struct ibv_device **list)
++{
++    /* Our array is plain calloc'd; the devices themselves are not owned. */
++    free(list);
++}
++
++const char *ibv_get_device_name(struct ibv_device *device)
++{
++    odl_resolve_real();
++    if (!device) return NULL;
++    if (odl_is_tb5_device(device)) return device->name;
++    if (real_get_device_name) return real_get_device_name(device);
++    return device->name;
++}
++
++/* ── _ibv_query_gid_ex (target of the inline ibv_query_gid_ex) ───────── */
++
++int _ibv_query_gid_ex(struct ibv_context *context, uint32_t port_num,
++                      uint32_t gid_index, struct ibv_gid_entry *entry,
++                      uint32_t flags, size_t entry_size)
++{
++    odl_resolve_real();
++
++    if (context && context->device && odl_is_tb5_device(context->device)) {
++        if (port_num != 1 || gid_index != 0 || !entry) return ENODATA;
++        if (entry_size < sizeof(*entry)) return EINVAL;
++        memset(entry, 0, sizeof(*entry));
++        odl_make_roce_v2_gid(&entry->gid);
++        entry->gid_index    = gid_index;
++        entry->port_num     = port_num;
++        entry->gid_type     = IBV_GID_TYPE_ROCE_V2;
++        entry->ndev_ifindex = 0;
++        return 0;
++    }
++
++    if (real_query_gid_ex)
++        return real_query_gid_ex(context, port_num, gid_index, entry, flags,
++                                 entry_size);
++    return EOPNOTSUPP;
++}
++
++/* ── ibv_query_gid (classic form; rdma_probe() calls this too) ───────── */
++
++/*
++ * Must be interposed as well as _ibv_query_gid_ex: the real libibverbs
++ * implementation walks provider-private context state that an OdinLink
++ * context does not have, and segfaults on it.
++ */
++int ibv_query_gid(struct ibv_context *context, uint8_t port_num, int index,
++                  union ibv_gid *gid)
++{
++    odl_resolve_real();
++
++    if (context && context->device && odl_is_tb5_device(context->device)) {
++        if (port_num != 1 || index != 0 || !gid) return ENODATA;
++        odl_make_roce_v2_gid(gid);
++        return 0;
++    }
++
++    if (real_query_gid)
++        return real_query_gid(context, port_num, index, gid);
++    return EOPNOTSUPP;
++}
+diff --git a/verbs/src/odl_tb5_verbs_qp.c b/verbs/src/odl_tb5_verbs_qp.c
+index d45260e..40612cf 100644
+--- a/verbs/src/odl_tb5_verbs_qp.c
++++ b/verbs/src/odl_tb5_verbs_qp.c
+@@ -68,21 +68,30 @@ static void *odl_qp_worker(void *arg)
+     odl_tb5_t h = ctx->handle;
+ 
+     while (qp->worker_running) {
+-        struct ibv_send_wr *wr = NULL;
++        bool     have_wr = false;
++        uint64_t w_wr_id = 0, w_addr = 0;
++        uint32_t w_len = 0, w_lkey = 0;
++        int      w_num_sge = 0;
+ 
+-        /* Dequeue one work request */
++        /* Dequeue one work request (copies, not caller pointers) */
+         pthread_mutex_lock(&qp->sq_lock);
+         if (qp->sq_count > 0) {
+-            wr = qp->sq[qp->sq_head];
++            w_wr_id   = qp->sq_wr_id[qp->sq_head];
++            w_addr    = qp->sq_addr[qp->sq_head];
++            w_len     = qp->sq_len[qp->sq_head];
++            w_lkey    = qp->sq_lkey[qp->sq_head];
++            w_num_sge = qp->sq_num_sge[qp->sq_head];
+             qp->sq_head = (qp->sq_head + 1) % ODL_VERBS_SQ_DEPTH;
+             qp->sq_count--;
++            have_wr = true;
+         }
+         pthread_mutex_unlock(&qp->sq_lock);
+ 
+-        if (!wr) {
+-            /* No work — poll for TX readiness with 100ms timeout.
+-             * This also yields the CPU when idle instead of busy-waiting. */
+-            odl_worker_poll_fd(qp, 100);
++        if (!have_wr) {
++            /* No send work: make receive progress, then yield briefly.
++             * The RX drain is what turns posted buffers into completions. */
++            if (odl_rq_drain(qp) == 0)
++                odl_worker_poll_fd(qp, 10);
+             continue;
+         }
+ 
+@@ -111,19 +120,18 @@ static void *odl_qp_worker(void *arg)
+         struct ibv_wc wc;
+         memset(&wc, 0, sizeof(wc));
+ 
+-        if (wr->num_sge > 0) {
+-            struct ibv_sge *sge = &wr->sg_list[0];
+-            int dmabuf_fd = odl_lookup_dmabuf(ctx, sge->lkey);
++        if (w_num_sge > 0) {
++            int dmabuf_fd = odl_lookup_dmabuf(ctx, w_lkey);
+ 
+             if (dmabuf_fd >= 0) {
+                 ret = odl_tb5_stream_send_dmabuf(
+                     h, qp->stream_id, 0,
+-                    dmabuf_fd, 0, sge->length);
++                    dmabuf_fd, 0, w_len);
+             } else {
+-                void *data = (void *)(uintptr_t)sge->addr;
++                void *data = (void *)(uintptr_t)w_addr;
+                 ret = odl_tb5_stream_send(
+                     h, qp->stream_id, 0,
+-                    data, sge->length);
++                    data, w_len);
+             }
+ 
+             if (ret == -EAGAIN) {
+@@ -131,7 +139,11 @@ static void *odl_qp_worker(void *arg)
+                 odl_logverbose("send EAGAIN stream=%u, re-queueing", qp->stream_id);
+                 pthread_mutex_lock(&qp->sq_lock);
+                 if (qp->sq_count < ODL_VERBS_SQ_DEPTH) {
+-                    qp->sq[qp->sq_tail] = wr;
++                    qp->sq_wr_id[qp->sq_tail]   = w_wr_id;
++                    qp->sq_addr[qp->sq_tail]    = w_addr;
++                    qp->sq_len[qp->sq_tail]     = w_len;
++                    qp->sq_lkey[qp->sq_tail]    = w_lkey;
++                    qp->sq_num_sge[qp->sq_tail] = w_num_sge;
+                     qp->sq_tail = (qp->sq_tail + 1) % ODL_VERBS_SQ_DEPTH;
+                     qp->sq_count++;
+                 }
+@@ -139,8 +151,9 @@ static void *odl_qp_worker(void *arg)
+                 continue;
+             }
+ 
++            wc.wr_id    = w_wr_id;
+             wc.status   = (ret == 0) ? IBV_WC_SUCCESS : IBV_WC_GENERAL_ERR;
+-            wc.byte_len = (ret == 0) ? sge->length : 0;
++            wc.byte_len = (ret == 0) ? w_len : 0;
+             wc.opcode   = IBV_WC_SEND;
+             wc.qp_num   = qp->base.qp_num;
+ 
+@@ -148,6 +161,7 @@ static void *odl_qp_worker(void *arg)
+                 odl_logerr("send failed stream=%u ret=%d", qp->stream_id, ret);
+         } else {
+             /* Zero-length send */
++            wc.wr_id    = w_wr_id;
+             wc.status   = IBV_WC_SUCCESS;
+             wc.byte_len = 0;
+             wc.opcode   = IBV_WC_SEND;
+@@ -208,6 +222,8 @@ struct ibv_qp *odl_create_qp(struct ibv_pd *pd,
+ 
+     /* Initialize SQ */
+     pthread_mutex_init(&qp->sq_lock, NULL);
++    pthread_mutex_init(&qp->rq_lock, NULL);
++    qp->rq_head = qp->rq_tail = qp->rq_count = 0;
+     qp->sq_head  = 0;
+     qp->sq_tail  = 0;
+     qp->sq_count = 0;
+@@ -322,7 +338,18 @@ int odl_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
+             return -ENOMEM;
+         }
+ 
+-        oqp->sq[oqp->sq_tail] = wr;
++        /* BUG14 fix: copy, never store the caller's stack pointer. */
++        oqp->sq_wr_id[oqp->sq_tail]   = wr->wr_id;
++        oqp->sq_num_sge[oqp->sq_tail] = wr->num_sge;
++        if (wr->num_sge > 0) {
++            oqp->sq_addr[oqp->sq_tail] = wr->sg_list[0].addr;
++            oqp->sq_len[oqp->sq_tail]  = wr->sg_list[0].length;
++            oqp->sq_lkey[oqp->sq_tail] = wr->sg_list[0].lkey;
++        } else {
++            oqp->sq_addr[oqp->sq_tail] = 0;
++            oqp->sq_len[oqp->sq_tail]  = 0;
++            oqp->sq_lkey[oqp->sq_tail] = 0;
++        }
+         oqp->sq_tail = (oqp->sq_tail + 1) % ODL_VERBS_SQ_DEPTH;
+         oqp->sq_count++;
+         atomic_fetch_add(&oqp->pending_sends, 1);
+@@ -340,72 +367,98 @@ int odl_post_recv(struct ibv_qp *qp, struct ibv_recv_wr *wr,
+                    struct ibv_recv_wr **bad_wr)
+ {
+     struct odl_verbs_qp *oqp = odl_qp_from_ibv(qp);
+-    struct odl_verbs_context *ctx = oqp->ctx;
+-    int dev_fd = ctx->base.cmd_fd;
+     *bad_wr = NULL;
+ 
++    /*
++     * BUG13 fix: this used to poll(5000) and perform the receive inline,
++     * returning -ETIMEDOUT/-EAGAIN when no data had arrived yet. Every verbs
++     * consumer PRE-POSTS receive buffers before any traffic exists (llama.cpp
++     * posts 24, RCCL and perftest do the same), so the first post always
++     * failed and RDMA setup aborted. A real post_recv only enqueues a buffer
++     * and returns immediately; the completion arrives later via the CQ.
++     */
++    pthread_mutex_lock(&oqp->rq_lock);
++
+     while (wr) {
++        if (oqp->rq_count >= ODL_VERBS_RQ_DEPTH) {
++            *bad_wr = wr;
++            pthread_mutex_unlock(&oqp->rq_lock);
++            odl_logerr("post_recv: RQ full on QP %u", qp->qp_num);
++            return -ENOMEM;
++        }
+         if (wr->num_sge > 0) {
+-            struct ibv_sge *sge = &wr->sg_list[0];
+-            uint8_t src_id = 0;
+-            uint32_t actual = 0;
+-
+-            /* Poll for RX readiness (up to 5 second timeout).
+-             * Since the fd is O_NONBLOCK, stream_recv returns -EAGAIN
+-             * immediately if no data is available. */
+-            if (dev_fd >= 0) {
+-                struct pollfd pfd = {
+-                    .fd     = dev_fd,
+-                    .events = POLLIN,
+-                };
+-                int pr = poll(&pfd, 1, 5000);
+-                if (pr <= 0 || !(pfd.revents & POLLIN)) {
+-                    *bad_wr = wr;
+-                    return pr == 0 ? -ETIMEDOUT : -EAGAIN;
+-                }
+-            }
++            /* Copy: the caller's wr/sge are typically stack-allocated. */
++            oqp->rq_wr_id[oqp->rq_tail] = wr->wr_id;
++            oqp->rq_addr[oqp->rq_tail]  = wr->sg_list[0].addr;
++            oqp->rq_len[oqp->rq_tail]   = wr->sg_list[0].length;
++            oqp->rq_tail = (oqp->rq_tail + 1) % ODL_VERBS_RQ_DEPTH;
++            oqp->rq_count++;
++            atomic_fetch_add(&oqp->pending_recvs, 1);
++        }
++        wr = wr->next;
++    }
+ 
+-            /* Non-blocking recv */
+-            int ret = odl_tb5_stream_recv(
+-                ctx->handle, oqp->stream_id,
+-                (void *)(uintptr_t)sge->addr,
+-                sge->length,
+-                &src_id, &actual);
++    pthread_mutex_unlock(&oqp->rq_lock);
++    return 0;
++}
+ 
+-            if (ret == -EAGAIN) {
+-                /* No data yet despite poll saying ready — rare race.
+-                 * Return the bad WR and let the caller retry. */
+-                *bad_wr = wr;
+-                return -EAGAIN;
+-            }
++/* Drain inbound stream data into posted RX buffers; post one WC per message.
++ * Non-blocking: returns the number of completions generated. */
++int odl_rq_drain(struct odl_verbs_qp *oqp)
++{
++    int completions = 0;
+ 
+-            struct ibv_wc wc;
+-            memset(&wc, 0, sizeof(wc));
+-            wc.qp_num   = qp->qp_num;
+-            wc.src_qp   = src_id;
+-            wc.opcode   = IBV_WC_RECV;
+-            wc.slid     = 0;
+-            wc.sl       = 0;
+-            wc.vendor_err = 0;
+-
+-            if (ret == 0) {
+-                wc.status   = IBV_WC_SUCCESS;
+-                wc.byte_len = actual;
+-            } else {
+-                wc.status   = IBV_WC_GENERAL_ERR;
+-                wc.byte_len = 0;
+-                odl_logerr("recv failed: stream=%u ret=%d", oqp->stream_id, ret);
+-            }
++    for (;;) {
++        uint64_t wr_id, addr;
++        uint32_t len;
+ 
+-            if (oqp->recv_cq)
+-                odl_cq_post(oqp->recv_cq, &wc);
++        pthread_mutex_lock(&oqp->rq_lock);
++        if (oqp->rq_count == 0) {
++            pthread_mutex_unlock(&oqp->rq_lock);
++            break;
++        }
++        wr_id = oqp->rq_wr_id[oqp->rq_head];
++        addr  = oqp->rq_addr[oqp->rq_head];
++        len   = oqp->rq_len[oqp->rq_head];
++        pthread_mutex_unlock(&oqp->rq_lock);
++
++        uint8_t  src_id = 0;
++        uint32_t actual = 0;
++        int ret = odl_tb5_stream_recv(oqp->ctx->handle, oqp->stream_id,
++                                      (void *)(uintptr_t)addr, len,
++                                      &src_id, &actual);
++        if (ret == -EAGAIN)
++            break;                      /* nothing pending -- leave buffer posted */
++
++        /* Consume the buffer only once we know data (or an error) arrived. */
++        pthread_mutex_lock(&oqp->rq_lock);
++        if (oqp->rq_count > 0) {
++            oqp->rq_head = (oqp->rq_head + 1) % ODL_VERBS_RQ_DEPTH;
++            oqp->rq_count--;
++        }
++        pthread_mutex_unlock(&oqp->rq_lock);
++        atomic_fetch_sub(&oqp->pending_recvs, 1);
+ 
+-            atomic_fetch_sub(&oqp->pending_recvs, 1);
++        struct ibv_wc wc;
++        memset(&wc, 0, sizeof(wc));
++        wc.wr_id  = wr_id;
++        wc.qp_num = oqp->base.qp_num;
++        wc.src_qp = src_id;
++        wc.opcode = IBV_WC_RECV;
++        if (ret == 0) {
++            wc.status   = IBV_WC_SUCCESS;
++            wc.byte_len = actual;
++        } else {
++            wc.status   = IBV_WC_GENERAL_ERR;
++            wc.byte_len = 0;
++            odl_logerr("recv failed: stream=%u ret=%d", oqp->stream_id, ret);
+         }
+-        wr = wr->next;
++        if (oqp->recv_cq)
++            odl_cq_post(oqp->recv_cq, &wc);
++        completions++;
+     }
+ 
+-    return 0;
++    return completions;
+ }
+ 
+ /* ── Query QP ───────────────────────────────────────────────────────── */
