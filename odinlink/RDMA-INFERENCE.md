@@ -640,3 +640,70 @@ from `poll_cq` introduced the ABBA). The reliable progress came from two things
 only: a test that reproduces the real access pattern in seconds and verifies
 every byte, and a driver diagnostic that prints the failing arithmetic. Build
 those first.
+
+
+---
+
+# Latency work — what moved and what did not
+
+## Measurement methodology first (learned the hard way)
+
+Five CLI ping-pong runs (2000 iterations each) across four configurations:
+
+| run | min | median | p95 | p99 | jitter |
+|---|---|---|---|---|---|
+| 10 us poll (baseline) | 10.71 | 22.47 | 59.69 | 69.22 | 14.85 |
+| 3 us poll | 10.66 | 22.27 | 29.85 | 67.02 | 9.93 |
+| + adversarial-review fixes | 10.54 | 21.97 | 43.36 | 67.61 | 11.59 |
+| CPU C-states blocked (1 node) | 10.55 | 22.06 | 22.62 | 28.76 | 3.48 |
+| CPU C-states blocked (2 nodes) | 10.53 | 22.10 | 61.57 | 64.12 | 15.21 |
+
+**min and median are reproducible; p95/p99 are not.** Min spans 0.18 us and the
+median holds at 22.0 +/- 0.19 us across every configuration, while p95/p99 swing
+3x under nominally identical conditions (compare the last two rows). Any
+conclusion drawn from a single-run tail comparison is unreliable — including the
+apparent "p99 down 57%" from blocking C-states, which the very next run
+contradicted.
+
+## What this establishes
+
+Negative results, but solid ones, because they are median-based:
+
+- **The fallback poll timer is not on the median path.** 10 us -> 3 us moved the
+  median 0.2 us. It only fires when the ISR races descriptor write-back, so it
+  shapes the tail alone.
+- **CPU idle states are not on the median path.** Blocking C1/C2/C3 entirely
+  (PM QoS via /dev/cpu_dma_latency) left the median at 22.06/22.10.
+- **Busy-poll is already enabled** (odl_busy_poll_us=50) and the median still
+  sits at 22 us — consistent with it hiding only the final task wakeup.
+
+By elimination the ~5.75 us/direction above wire cost sits in the kernel
+completion path, and the structural candidate is the double scheduler hop:
+rings are allocated with `start_poll = NULL` (driver/odl_tb5_ring_dma.c:510-515),
+so every receive goes MSI-X -> schedule_work -> kworker -> wake_up_interruptible.
+**That attribution is inference, not measurement** — confirming it needs ftrace on
+workqueue_queue_work -> workqueue_execute_start deltas, which should be done
+before attempting the start_poll rework.
+
+## Do not disable CPU C-states
+
+Writing 0 to /dev/cpu_dma_latency blocks every state with non-zero exit latency —
+C1 (1 us), C2 (18 us) AND C3 (350 us) — leaving only POLL. Every core spins:
+maximum power and heat on a machine that also runs inference. The constraint is
+transient (held only while a process keeps the fd open, released on exit) but it
+is not worth having, and the benefit did not reproduce.
+
+## Inference impact: none, as predicted
+
+27B Q6_K, 2 nodes, -sm layer, over OdinLink RDMA:
+
+| build | pp512 | tg128 |
+|---|---|---|
+| before | 290.03 +/- 61.04 | 9.17 +/- 0.00 |
+| 3 us poll + review fixes | 290.68 +/- 61.73 | 9.16 +/- 0.02 |
+
+Unchanged, and correctly so: `-sm layer` crosses the wire **once per token**, so
+at ~9 t/s the transport contributes ~22 us against a ~110 ms/token budget. Even
+halving RTT would be invisible. Interconnect latency matters for `-sm tensor`
+(an all-reduce every layer, where the 286 us TCP floor crushed it to 3.65 t/s)
+and for RCCL collectives — not for pipeline parallelism.
