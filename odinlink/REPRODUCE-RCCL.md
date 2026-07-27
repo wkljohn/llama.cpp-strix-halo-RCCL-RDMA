@@ -1,0 +1,110 @@
+# Reproducible: RCCL over OdinLink RDMA (Thunderbolt/USB4)
+
+End-to-end recipe for running RCCL collectives over Thunderbolt RDMA on two
+AMD Strix Halo (gfx1151) nodes, with no NIC.
+
+## 0. What you need
+
+- 2 nodes, one USB4/Thunderbolt cable between them
+- An IP link over the same cables for bootstrap (we use `bond0`, 10.4.0.1/2)
+- ROCm 7.2.0, and RCCL built for gfx1151
+
+## 1. Build OdinLink (both nodes)
+
+```bash
+git clone -b strix-halo-verbs-fixes https://github.com/wkljohn/OdinLink-Five.git
+cd OdinLink-Five
+cmake -B build -DBUILD_VERBS=ON -DBUILD_TRAY=OFF && cmake --build build -j$(nproc)
+make -C driver
+```
+
+Both nodes must run the **same build** — the wire format carries a fragment
+index and an 8-byte stream header, so mismatched builds will not interoperate.
+
+## 2. Build RCCL for gfx1151
+
+Stock RCCL does not target gfx1151. Use the patched tree:
+
+```bash
+git clone --depth 1 -b gfx1151-rccl https://github.com/kyuz0/rocm-systems.git
+cd rocm-systems/projects/rccl && mkdir -p build && cd build
+CXX=/opt/rocm/bin/hipcc cmake .. -DCMAKE_CXX_COMPILER=/opt/rocm/bin/hipcc \
+  -DDEFAULT_GPUS="gfx1151" -DGPU_TARGETS="gfx1151" -DAMDGPU_TARGETS="gfx1151" \
+  -DBUILD_TESTS=OFF -DGENERATE_SYM_KERNELS=OFF -DENABLE_AMDSMI=OFF \
+  -DCMAKE_BUILD_TYPE=Release
+make -j$(nproc)
+```
+
+## 3. Bring up the link (both nodes)
+
+```bash
+sudo rmmod thunderbolt_ibverbs 2>/dev/null   # conflicts: same NHI DMA
+sudo insmod driver/odl_tb5.ko e2e=0 max_devices=1 login_max_retries=20 odl_busy_poll_us=50
+```
+
+`max_devices=1` is required with two cables: both XDomain services report
+`route=2` and the driver's route lookup cannot tell them apart (upstream defect),
+so binding both makes the handshake fail. Bind one from the start rather than
+unbinding afterwards.
+
+Both nodes must reach READY — this is the only success signal:
+
+```bash
+sudo dmesg | grep OdinLink | tail
+#   DMA path verified, resetting rings for userspace
+#   entering READY state
+```
+
+The login handshake is racy. If one side reports `login request failed: -110`
+repeatedly, unload on both and reload them within a few seconds of each other;
+it usually succeeds within 1-3 attempts.
+
+## 4. Verify the transport before involving RCCL
+
+Do this first — it isolates transport faults from RCCL faults, and it verifies
+every byte (a corrupting transport still produces plausible benchmark numbers):
+
+```bash
+gcc -O2 -o odl_rdma_stress tests/odl_rdma_stress.c -libverbs -lpthread
+export LD_PRELOAD=$PWD/build/verbs/libodl_tb5_verbs.so
+export LD_LIBRARY_PATH=$PWD/build/verbs:$PWD/build/lib
+export ODL_RDMA_GID_IFACE=bond0
+
+# peer
+./odl_rdma_stress --server --local-ip 10.4.0.2 --total 2G --bidir
+# head
+./odl_rdma_stress --client 10.4.0.2 --local-ip 10.4.0.1 --total 2G --bidir
+```
+
+Expect `PASS: 8192 msgs ... recv+verified 8192/8192` on **both** peers.
+Exit codes: `0` ok, `2` data corruption, `3` stall.
+
+## 5. Point RCCL at OdinLink
+
+```bash
+export NCCL_NET_PLUGIN=ODL_TB5
+export NCCL_PLUGIN_DIR=/path/to/OdinLink-Five/build/rccl
+export NCCL_SOCKET_IFNAME=bond0     # bootstrap only; payload goes over RDMA
+export NCCL_IB_DISABLE=1 NCCL_CUMEM_ENABLE=0
+export NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NET
+```
+
+Confirm from the log that it actually bound:
+
+```
+NCCL INFO Initialized NET plugin ODL_TB5     <- good
+NCCL INFO ... is unsupported                 <- rejected, silently fell back
+NCCL INFO NET/Socket : Using [0]bond0        <- you are NOT on RDMA
+```
+
+That silent fallback is the easiest way to "measure RDMA" and actually measure
+TCP. Always check.
+
+## Notes / known limits
+
+- `odl_tb5` and `thunderbolt_ibverbs` cannot coexist — both drive the same NHI.
+- `odl_tb5` coexists fine with `thunderbolt_net`, so your IP bond keeps working.
+- The verbs path is an LD_PRELOAD shim: OdinLink registers no kernel `ib_device`,
+  so rdma-core cannot discover it and `ibv_devices` is empty without the preload.
+- Reloading the whole Thunderbolt stack disturbs the IP bond on the same cables
+  (`ip neigh flush dev bond0`, and watch for a slave with carrier but no traffic).

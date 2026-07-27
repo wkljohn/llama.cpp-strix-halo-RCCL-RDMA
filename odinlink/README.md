@@ -1,3 +1,22 @@
+> ## 📦 Ready-to-use fork: [wkljohn/OdinLink-Five @ strix-halo-verbs-fixes](https://github.com/wkljohn/OdinLink-Five/tree/strix-halo-verbs-fixes)
+>
+> All fixes below are pushed to a fork so you can clone and build directly —
+> no patch application needed:
+>
+> ```bash
+> git clone -b strix-halo-verbs-fixes https://github.com/wkljohn/OdinLink-Five.git
+> cd OdinLink-Five
+> cmake -B build -DBUILD_VERBS=ON -DBUILD_TRAY=OFF && cmake --build build -j$(nproc)
+> make -C driver
+> ```
+>
+> Upstream is [Geramy/OdinLink-Five](https://github.com/Geramy/OdinLink-Five)
+> (driver GPL-2.0, verbs provider MIT). The branch is 7 commits on top of
+> upstream `ed60505`. `patches/odinlink-verbs-and-driver-fixes.patch` is kept in
+> sync for anyone who prefers patching a pristine checkout.
+>
+> Measured results: [RESULTS.md](RESULTS.md).
+
 > ## ✅ RDMA INFERENCE IS WORKING — see [RDMA-INFERENCE.md](RDMA-INFERENCE.md)
 >
 > Two Strix Halo nodes now run llama.cpp cross-node inference with tensor traffic over
