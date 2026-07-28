@@ -40,6 +40,36 @@ The measurement this whole effort was for. `-sm tensor`, 27B Q6_K, 2 nodes, `-ts
 zero occurrences of `Using network Socket`, and the plugin logged **69120 isend / 69120
 irecv / 0 failures**.
 
+### Why a 2.9× faster collective bought nothing — the arithmetic
+
+Without this, "we measured no gain" reads like a measurement error. It is a ceiling:
+
+| term | value |
+|---|---|
+| Token budget at 3.33 t/s | **300 ms** |
+| Compute, if TP split perfectly (half of single-node's 105 ms) | ~53 ms |
+| **Everything else** | **248 ms/token = 4.13 ms per sync point** |
+| What RDMA can address (60 syncs × 186 µs saved) | **11.2 ms = 3.7 %** |
+| Predicted best case | 3.46 t/s |
+| Measured | **3.33 / 3.32** |
+
+**RDMA can only ever touch 3.7 % of the token budget**, which is indistinguishable from
+run-to-run noise — exactly what was observed. The other **4.13 ms per sync point** is graph
+dispatch, RPC subgraph serialisation and backend synchronisation: roughly **40× the entire
+collective cost**.
+
+Even a *zero-latency* collective would leave ~289 ms/token — still **2.6× slower than
+pipeline's 109 ms**. Cross-node tensor parallelism cannot be rescued here by improving the
+interconnect.
+
+Two independent confirmations that this is structural rather than transport:
+
+- The TCP-era A/B: butterfly **3.10** vs RCCL **3.65**. Two completely different collective
+  mechanisms, both ≈3 t/s against pipeline's 8.87. Changing *how* ranks communicate barely
+  moves the total.
+- Pipeline at 109 ms/token is within 4 % of single-node's 105 ms — it crosses the wire once
+  per token and pays almost nothing for it.
+
 ### Why a 2.9× faster collective bought nothing
 
 The 2B result was *break-even* over TCP, which already said per-sync **dispatch** overhead
