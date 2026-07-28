@@ -25,10 +25,51 @@ nodes cost ~3.6 % because `-sm layer` crosses the wire once per token. Two nodes
 are for *capacity*, not speed. RDMA recovers about half the cross-node penalty
 (8.83 → 9.16 against a 9.50 ceiling).
 
-> **Every inference figure on this page is `-sm layer` (pipeline).** Tensor-parallel
-> *inference* over RDMA has still not been benchmarked — but the collective it depends on
-> now works and is measured at **100 µs/allreduce** (below), against 286 µs over TCP.
-> Nothing known blocks the inference run; it simply has not been made yet.
+## Tensor parallel over RDMA — measured, and it changes nothing
+
+The measurement this whole effort was for. `-sm tensor`, 27B Q6_K, 2 nodes, `-ts 50/50`:
+
+| collective transport | tg128 | pp512 |
+|---|---|---|
+| **RDMA (OdinLink plugin)** | **3.33** | 222.40 |
+| TCP over bond0 | 3.32 | 264.85 |
+| *`-sm layer` (pipeline) over RDMA, for scale* | *9.20* | *246.69* |
+
+**Identical within noise** — despite the collective itself being **2.9× faster** over RDMA
+(100 µs vs 286 µs). Transport was verified, not assumed: `NCCL INFO Using network ODL_TB5`,
+zero occurrences of `Using network Socket`, and the plugin logged **69120 isend / 69120
+irecv / 0 failures**.
+
+### Why a 2.9× faster collective bought nothing
+
+The 2B result was *break-even* over TCP, which already said per-sync **dispatch** overhead
+alone roughly equals the entire butterfly cost. RDMA lowers the collective; it does not
+touch dispatch. So the term that dominates was never the one being optimised.
+
+This is the honest headline: **RDMA over Thunderbolt makes cross-node collectives 2.9×
+faster and cross-node tensor-parallel inference no faster at all.** Pipeline parallelism
+remains ~2.8× ahead for this model. Anyone hoping a faster interconnect rescues `-sm tensor`
+on this class of hardware should read that result before buying cables.
+
+Where RDMA *does* pay: `-sm layer` at 9.20 vs 8.83 t/s over TCP, and the collective floor
+itself, which matters for any workload dominated by all-reduce rather than dispatch.
+
+### Getting `-sm tensor` to run at all
+
+It deadlocked before producing a token. The peer was never in the collective — it was stuck
+inside `ncclCommInitRank`:
+
+```
+ggml_cuda_world_init_once -> ncclCommInitRank_impl -> initTransportsRank
+  -> bootstrapAllGather -> socketRingAllGatherUnidir -> recv()   [blocked]
+```
+
+Both ranks initialised the world lazily, inside the first `GGML_OP_ALLREDUCE`, and under
+`-sm tensor` those moments are unrelated. `ggml_backend_cuda_world_init()` was exported with
+**zero call sites**. Fixed by calling it eagerly on both ranks (detached thread on the peer,
+so RPC serving is not blocked) and widening the rendezvous retry from 60 s to 5 min — the
+peer must start first, but must then survive the head's ROCm init. Proven over TCP before
+RDMA, so the fix stands independent of transport.
 
 ## RCCL collectives over RDMA — working
 
