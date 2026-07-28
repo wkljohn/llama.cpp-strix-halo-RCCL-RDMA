@@ -31,14 +31,31 @@ The measurement this whole effort was for. `-sm tensor`, 27B Q6_K, 2 nodes, `-ts
 
 | collective transport | tg128 | pp512 |
 |---|---|---|
-| **RDMA (OdinLink plugin)** | **3.33** | 222.40 |
-| TCP over bond0 | 3.32 | 264.85 |
+| **TCP over bond0** | **3.50 ± 0.01** | **282.71 ± 2.81** |
+| RDMA (OdinLink plugin) | 3.30 ± 0.01 | 216.73 ± 0.76 |
 | *`-sm layer` (pipeline) over RDMA, for scale* | *9.20* | *246.69* |
 
-**Identical within noise** — despite the collective itself being **2.9× faster** over RDMA
-(100 µs vs 286 µs). Transport was verified, not assumed: `NCCL INFO Using network ODL_TB5`,
-zero occurrences of `Using network Socket`, and the plugin logged **69120 isend / 69120
-irecv / 0 failures**.
+**RDMA is slower — 6 % on decode, 30 % on prompt processing** — despite the collective
+itself being **2.9× faster** over RDMA (100 µs vs 286 µs). Three repetitions each; the
+±0.01 error bars put this well outside noise. Transport verified, not assumed:
+`NCCL INFO Using network ODL_TB5`, zero `Using network Socket`, and the plugin logged
+**69120 isend / 69120 irecv / 0 failures**.
+
+> **Correction.** An earlier revision reported 3.33 vs 3.32 and called them "identical
+> within noise". Those were **single runs** (`-r 1`) against llama-bench's default of 5 —
+> the same single-run-as-property error this page retracts elsewhere for the bidirectional
+> throughput claim. With three repetitions the difference is unambiguous and in the
+> opposite direction from the project's hypothesis.
+
+### Why a faster wire makes the system slower
+
+The plugin busy-spins: a `poll(POLLOUT, 2 ms)` that returns ready every time and is
+immediately re-issued, plus a 20 µs `nanosleep` receive loop. That burns CPU continuously.
+
+In a path already dominated by **host-side dispatch** (4.13 ms per sync point, below),
+CPU stolen from dispatch costs more than a 186 µs faster collective wins. The transport
+gets faster and the system gets slower. This also explains the prompt-processing gap,
+which is the most dispatch-heavy phase.
 
 ### Why a 2.9× faster collective bought nothing — the arithmetic
 
