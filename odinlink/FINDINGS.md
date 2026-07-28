@@ -46,6 +46,7 @@ Numbers live in [RESULTS.md](RESULTS.md). Recipes live in
 | 26 | `remove()` never returns the `max_devices` slot | one peer restart wedges the link until a module reload | **fixed here** |
 | 27 | Duplex traffic loses two consecutive fragments | ~1 run in 4 corrupts; **blocks collectives** | **open** |
 | 28 | RX callback ignores NHI error flags | hardware-flagged frames accepted as valid | **open** |
+| 29 | Verbs TX worker busy-spins when idle | steals CPU; makes RDMA *slower* than TCP for dispatch-bound workloads | **open** |
 
 "Fixed here" means the patch is on the
 [`strix-halo-verbs-fixes` branch](https://github.com/wkljohn/OdinLink-Five/tree/strix-halo-verbs-fixes)
@@ -850,6 +851,72 @@ sequencing proves *continuity*, not *integrity*.
 **Fix:** check the flags before copying; count CRC errors, overruns, short descriptors,
 `payload_len` exceeding the descriptor, fragment gaps and assembly failures; expose them
 read-only. Do not rate-limit away the only evidence.
+
+---
+
+# BUG 29 — the verbs TX worker busy-spins when idle (OPEN)
+
+**Severity: it inverts the entire value proposition.** This is why RDMA measured *slower*
+than TCP for cross-node tensor parallelism.
+
+`verbs/src/odl_tb5_verbs_qp.c`, worker loop, idle branch:
+
+```c
+if (!have_wr) {
+    /* No send work: make receive progress, then yield briefly. */
+    odl_worker_poll_fd(qp, 2);      /* polls POLLOUT, 2 ms timeout */
+    continue;
+}
+```
+
+The intent is to yield. It never does. The device is writable essentially always, so
+`poll(POLLOUT)` returns **immediately** rather than waiting out its timeout, and the loop
+runs flat out for as long as the send queue is empty — one core, continuously, per QP.
+Confirmed by strace: `poll([{fd=9, events=POLLOUT}], 1, 2) = 1` repeating back-to-back.
+
+### Why it matters more than it looks
+
+Cross-node tensor parallelism is bound by **host-side dispatch** (~4.13 ms per sync point
+against a 100 µs collective — see [RESULTS.md](RESULTS.md)). CPU taken from that dispatch
+costs more than a 2.9× faster collective returns:
+
+| transport | tg128 |
+|---|---|
+| TCP | **3.50 ± 0.01** |
+| RDMA | 3.30 ± 0.01 |
+
+**A faster wire that costs CPU is a net loss when the bottleneck is the host.** Any
+transport competing against sockets on a dispatch-bound workload must be judged on CPU
+cost, not just latency and bandwidth.
+
+### The fix is NOT a different poll mask — that was tried and it broke
+
+Switching the idle wait to `POLLIN` looks obvious: it genuinely blocks, since inbound data
+is the only thing that creates receive work. It is wrong. This worker must also wake when
+the **caller posts a new send**, and waiting on RX means a freshly posted send is not
+noticed until the 2 ms timeout expires or unrelated traffic arrives. Under the ggml-rpc
+bulk-upload pattern that is enough to abort:
+
+```
+ggml_backend_rpc_buffer_set_tensor -> ggml_abort   (during load_all_data)
+```
+
+**Note the trap:** `odl_rdma_stress --bidir` **passed at 9.06 Gb/s with that broken
+change in place.** The stress test's access pattern does not exercise the failing case, so
+it is not sufficient validation here — a full tensor-parallel run is required, which costs
+~10 minutes per attempt.
+
+### The correct fix
+
+A real wakeup channel, not a poll-mask change. Add a condition variable (or eventfd)
+alongside `sq_lock`, signal it from `post_send` after enqueueing, and have the idle branch
+`pthread_cond_timedwait()` on it. Then the worker sleeps until there is genuinely work,
+wakes immediately on a new send, and keeps a bounded timeout as a safety net.
+
+Not attempted here: the payoff is capped at ~6 % on a path that is structurally 2.6×
+behind pipeline anyway, the validation loop is ~10 minutes, and the fast regression test
+demonstrably does not catch breakage in this path. Worth doing deliberately rather than
+opportunistically.
 
 ---
 
