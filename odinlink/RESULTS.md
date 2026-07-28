@@ -63,12 +63,12 @@ Without this, "we measured no gain" reads like a measurement error. It is a ceil
 
 | term | value |
 |---|---|
-| Token budget at 3.33 t/s | **300 ms** |
+| Token budget at 3.30 t/s (RDMA) | **303 ms** |
 | Compute, if TP split perfectly (half of single-node's 105 ms) | ~53 ms |
 | **Everything else** | **248 ms/token = 4.13 ms per sync point** |
 | What RDMA can address (60 syncs × 186 µs saved) | **11.2 ms = 3.7 %** |
-| Predicted best case | 3.46 t/s |
-| Measured | **3.33 / 3.32** |
+| Predicted best case if fully realised | ~3.43 t/s |
+| Measured (3 reps) | **RDMA 3.30 ± 0.01, TCP 3.50 ± 0.01** |
 
 **RDMA can only ever touch 3.7 % of the token budget**, which is indistinguishable from
 run-to-run noise — exactly what was observed. The other **4.13 ms per sync point** is graph
@@ -94,7 +94,7 @@ alone roughly equals the entire butterfly cost. RDMA lowers the collective; it d
 touch dispatch. So the term that dominates was never the one being optimised.
 
 This is the honest headline: **RDMA over Thunderbolt makes cross-node collectives 2.9×
-faster and cross-node tensor-parallel inference no faster at all.** Pipeline parallelism
+faster and cross-node tensor-parallel inference *slower*.** Pipeline parallelism
 remains ~2.8× ahead for this model. Anyone hoping a faster interconnect rescues `-sm tensor`
 on this class of hardware should read that result before buying cables.
 

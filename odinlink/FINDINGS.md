@@ -461,9 +461,10 @@ for (size_t jj = n_backends; jj-- > 0; ) {
 > **measured** TP-over-TCP results (27B at 3.65/4.02 t/s), which could only come from
 > completed TP runs. Two independent source reviews caught it.
 >
-> **`-sm tensor` over RDMA has still never been run** — but because nobody has yet pointed a
-> TP run at the `ODL_TB5` plugin, not because anything blocks it. See
-> [REPRODUCE-RCCL.md](REPRODUCE-RCCL.md).
+> **`-sm tensor` over RDMA has since been run.** It needed one more fix — eager world init,
+> because both ranks called `ncclCommInitRank` lazily at unrelated moments and deadlocked in
+> RCCL's bootstrap all-gather. Result: TCP 3.50 ± 0.01 beats RDMA 3.30 ± 0.01 t/s. See
+> [RESULTS.md](RESULTS.md).
 
 **What remains.** `docs/REPRODUCE.md` records an *intermittent* 27B startup hang. Its cause
 is not determined from source. The likely hardening is eager world init: the exported

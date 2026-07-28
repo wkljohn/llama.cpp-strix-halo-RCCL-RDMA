@@ -48,7 +48,7 @@ RDMA recovers about half the cross-node penalty (8.83 → 9.16 against a 9.50 ce
 | ✅ **Beats the host butterfly** | +13–18 % on the 27B across two independent sessions. The collective is genuinely faster than GET/SET round-trips |
 | ✅ **Runs models too big for one node** | 298B hy_v3 MoE (95 GiB) tensor-parallels across both nodes at 1.78 t/s |
 | ⚠️ **RDMA discovery is an LD_PRELOAD shim** | OdinLink registers no kernel `ib_device`; anything not inheriting the preload cannot see it |
-| ⬜ **RCCL over RDMA not measured** | Not blocked — `-sm tensor` runs over TCP and the old rendezvous deadlock is fixed. The run pointing TP at the RDMA plugin has not been made yet |
+| ❌ **RDMA does NOT help tensor parallel** | Measured: TCP **3.50 ± 0.01** beats RDMA **3.30 ± 0.01** t/s. The collective is 2.9× faster over RDMA, but TP is bound by host dispatch (~4.13 ms/sync vs a 100 µs collective), so a transport that costs CPU loses. See [odinlink/RESULTS.md](odinlink/RESULTS.md) |
 
 ## Why this exists
 
