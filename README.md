@@ -28,10 +28,13 @@ Two parts, usable independently:
 | TCP over bond0 | 292.11 ± 62.37 | 8.83 ± 0.03 | — |
 | *single node (reference)* | *224.68* | *9.50 ± 0.05* | — |
 
-Byte-verified, not inferred from "the benchmark finished": 21 GiB unidirectional
-(86016/86016 messages) and 2 GiB each way bidirectional at 9.84 Gb/s full duplex.
-`llama-bench` measures speed, not correctness — a corrupting transport still prints a
-plausible t/s, and one did.
+Byte-verified, not inferred from "the benchmark finished": 21 GiB unidirectional,
+86016/86016 messages. `llama-bench` measures speed, not correctness — a corrupting
+transport still prints a plausible t/s, and one did.
+
+*(An earlier "2 GiB each way bidirectional, 9.84 Gb/s" figure is retracted: it was a single
+lucky run. Duplex reliability turned out to depend on cable quality — see
+[odinlink/RESULTS.md](odinlink/RESULTS.md).)*
 
 **Single node is still fastest for a model that fits.** Two nodes are for *capacity*.
 RDMA recovers about half the cross-node penalty (8.83 → 9.16 against a 9.50 ceiling).
@@ -57,10 +60,15 @@ Mainline llama.cpp shipped NCCL/RCCL tensor parallelism in Apr 2026 (b8738) — 
 world communicator spanning separate machines. Plus **two bug fixes that make
 `-sm tensor` over RPC work at all**, and an RDMA transport that needs no new hardware.
 
-Cross-node TP is latency-bound. At 286 µs/op the per-layer all-reduce dominates and
-pipeline wins outright; at ~22 µs the comm term drops ~13×, which is the regime where TP
-can plausibly overtake it. That measurement is the open question — see
-[odinlink/REPRODUCE-RCCL.md](odinlink/REPRODUCE-RCCL.md) for how to make it.
+Cross-node TP was assumed to be latency-bound: at 286 µs/op the per-layer all-reduce
+dominates, so a ~13× lower comm term should let TP overtake pipeline. **That measurement
+has now been made, and the assumption was wrong.** TP is bound by *host dispatch*
+(~4.13 ms per sync point against a 100 µs collective), so RDMA can address only ~3.7 % of
+the token budget — and because the transport busy-spins, it gives back more than it gains:
+TCP 3.50 ± 0.01 vs RDMA 3.30 ± 0.01 t/s, both far behind pipeline's 9.20.
+
+The useful conclusion: **a faster interconnect does not rescue cross-node tensor
+parallelism here.** Full arithmetic in [odinlink/RESULTS.md](odinlink/RESULTS.md).
 
 ## Quick start — RCCL tensor parallel
 
