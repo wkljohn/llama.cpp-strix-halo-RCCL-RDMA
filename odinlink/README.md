@@ -28,6 +28,7 @@ Then pick your path:
 | you want | read |
 |---|---|
 | llama.cpp inference across two nodes (`-sm layer`) — **the working, fastest path** | **[REPRODUCE-RPC.md](REPRODUCE-RPC.md)** |
+| speculative decoding (MTP / DFlash) on a hy_v3 target across the split | [SPECULATIVE-HY3.md](SPECULATIVE-HY3.md) |
 | RCCL collectives over the same link | [REPRODUCE-RCCL.md](REPRODUCE-RCCL.md) |
 | every number, with its caveats | [RESULTS.md](RESULTS.md) |
 | the 23 defects found getting here, root cause + fix each | [FINDINGS.md](FINDINGS.md) |

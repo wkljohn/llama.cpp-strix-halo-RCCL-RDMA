@@ -1,0 +1,93 @@
+From: Hy3 speculative-decoding fixes for llama.cpp
+Base: aadd131
+
+Four independent fixes needed to run speculative decoding against a
+hy_v3 (Hunyuan Hy3) target. Each was found by a silent failure - the
+model loads, generates correct text, and reports 0.00 acceptance.
+
+   common/speculative.cpp | 24 +++++++++++++++++++++++-
+   conversion/qwen.py     |  7 +++++++
+   src/models/hy-v3.cpp   | 10 ++++++++++
+   3 files changed, 40 insertions(+), 1 deletion(-)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 5653a90..c54e6fc 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -2319,6 +2319,23 @@ common_speculative_init_result::common_speculative_init_result(
+     auto mparams = common_model_params_to_llama(params);
+     auto cparams = common_context_params_to_llama(params);
+ 
++    // Honour --spec-draft-device / -devd for the draft model.
++    //
++    // common_model_params_to_llama() copies params.devices and params.tensor_split from
++    // the TARGET, so with `-dev ROCm0,RPC0 --tensor-split 48,52` the draft head was being
++    // split across the RPC boundary too - half its weights landing on the remote node, so
++    // every draft step paid a Thunderbolt round-trip. --spec-draft-device parses into
++    // params.speculative.draft.devices (arg.cpp:4016) but nothing on the server path ever
++    // read it; only examples/speculative/speculative.cpp:83 applied it, making the flag a
++    // silent no-op for llama-server.
++    //
++    // When the flag is given, override the device list and clear the inherited
++    // tensor_split so the draft is placed solely on the requested device(s).
++    if (!params.speculative.draft.devices.empty()) {
++        mparams.devices      = params.speculative.draft.devices.data();
++        mparams.tensor_split = nullptr;
++    }
++
+     if (spec_mtp) {
+         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+     }
+@@ -2333,7 +2350,12 @@ common_speculative_init_result::common_speculative_init_result(
+         model_path = params.speculative.draft.mparams.path;
+         LOG_INF("%s: loading draft model '%s'\n", __func__, model_path.c_str());
+ 
+-        llama_model * model_dft = llama_model_load_from_file(params.model.path.c_str(), mparams);
++        // Load the DRAFT model, not the target. model_path is derived from
++        // params.speculative.draft.mparams.path just above and is what the log
++        // line reports; passing params.model.path here silently loaded the
++        // target a second time, making `-md <draft>` a no-op (and, for a large
++        // target, a duplicate multi-GB load).
++        llama_model * model_dft = llama_model_load_from_file(model_path.c_str(), mparams);
+         if (model_dft == NULL) {
+             LOG_ERR("%s: failed to load draft model, '%s'\n", __func__, model_path.c_str());
+             return;
+diff --git a/conversion/qwen.py b/conversion/qwen.py
+index d1127f7..9259fa5 100644
+--- a/conversion/qwen.py
++++ b/conversion/qwen.py
+@@ -687,6 +687,13 @@ class DFlashModel(Qwen3Model):
+         name, gen = item
+         if not name.startswith("model."):
+             name = "model." + name
++        # DFlash shares the TARGET's token embedding and output head; MODEL_ARCH.DFLASH
++        # has no TOKEN_EMBD/OUTPUT entry, so a checkpoint that ships embed_tokens (as
++        # AngelSlim's Hy3-DFlash-B8 does) otherwise dies in map_tensor_name with
++        # "Can not map tensor 'model.embed_tokens.weight'". Every other tensor in that
++        # checkpoint maps cleanly (norm->output_norm, fc->fc, hidden_norm->enc.output_norm).
++        if name in ("model.embed_tokens.weight", "model.lm_head.weight", "lm_head.weight"):
++            return None
+         return super().filter_tensors((name, gen))
+ 
+ 
+diff --git a/src/models/hy-v3.cpp b/src/models/hy-v3.cpp
+index 47a0bea..415b3d4 100644
+--- a/src/models/hy-v3.cpp
++++ b/src/models/hy-v3.cpp
+@@ -121,6 +121,16 @@ llama_model_hy_v3::graph::graph(const llama_model & model, const llm_graph_param
+ 
+     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
+     for (int il = 0; il < n_layer; ++il) {
++        // Export the layer INPUT (post-embedding residual, pre-attn-norm) so DFlash/
++        // EAGLE3/DSpark drafters can extract target features. hy_v3 previously never
++        // assigned this, so llama_set_embeddings_layer_inp() captured nothing and any
++        // such drafter would silently score 0.00 acceptance. Only trunk layers are
++        // captured - n_layer() excludes the appended MTP block, and the capture-enable
++        // vector is sized to trunk layers only. Free when unused: the tensor is only
++        // marked as a graph output when the corresponding enable flag is set.
++        // Matches qwen3.cpp's capture point exactly.
++        res->t_layer_inp[il] = inpL;
++
+         ggml_tensor * inpSA = inpL;
+ 
+         cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
